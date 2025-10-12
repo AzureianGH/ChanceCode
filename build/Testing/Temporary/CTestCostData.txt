@@ -1,0 +1,3 @@
+chancecodec_simple_add 2 0.0277003
+chancecodec_verify_simple_add 2 0.02023
+---

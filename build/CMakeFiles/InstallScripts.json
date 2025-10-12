@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"I:/ChanceCode/build/cmake_install.cmake",
+		"I:/ChanceCode/build/tests/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

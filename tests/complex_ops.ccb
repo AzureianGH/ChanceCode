@@ -1,0 +1,78 @@
+ccbytecode 2
+
+.extern mix_external params=(i32,i32) returns=i32
+
+.global g8 type=i8 init=7
+.global gptr type=ptr init=null
+
+.func const_binop ret=i32 params=0 locals=0
+  const i32 40
+  const i32 2
+  binop add i32
+  ret
+.endfunc
+
+.func local_i16 ret=i32 params=1 locals=1
+.params i16
+.locals i16
+  load_param 0
+  store_local 0
+  load_local 0
+  const i16 3
+  binop add i16
+  convert sext i16 i32
+  ret
+.endfunc
+
+.func local_ptr ret=ptr params=1 locals=1
+.params ptr
+.locals ptr
+  load_param 0
+  store_local 0
+  addr_param 0
+  ret
+.endfunc
+
+.func global_ops ret=i32 params=0 locals=0
+  load_global g8
+  const i8 1
+  binop add i8
+  store_global g8
+  load_global g8
+  convert zext i8 i32
+  ret
+.endfunc
+
+.func indirect ret=i32 params=0 locals=1
+.locals ptr
+  stack_alloc 8 8
+  store_local 0
+  load_local 0
+  const i32 99
+  store_indirect i32
+  load_local 0
+  load_indirect i32
+  ret
+.endfunc
+
+.func branch_test ret=i1 params=1 locals=0
+.params i32
+  load_param 0
+  const i32 0
+  compare gt i32
+  ret
+.endfunc
+
+.func call_test ret=i32 params=0 locals=0
+  const i32 1
+  const i32 2
+  call mix_external i32 (i32,i32)
+  ret
+.endfunc
+
+.func drop_test ret=i32 params=0 locals=0
+  const i32 42
+  drop i32
+  const i32 7
+  ret
+.endfunc

@@ -1,0 +1,7 @@
+ccbytecode 2
+
+.func foo ret=i32 params=2 locals=0
+.params i16 ptr
+  const i32 0
+  ret
+.endfunc

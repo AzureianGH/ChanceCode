@@ -1,0 +1,2 @@
+E:\w64devkit\w64devkit\bin\ar.exe qc libchancecode_core.a CMakeFiles/chancecode_core.dir/src/backend.c.obj CMakeFiles/chancecode_core.dir/src/bytecode.c.obj CMakeFiles/chancecode_core.dir/src/diagnostics.c.obj CMakeFiles/chancecode_core.dir/src/loader.c.obj
+E:\w64devkit\w64devkit\bin\ranlib.exe libchancecode_core.a
