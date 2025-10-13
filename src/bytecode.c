@@ -114,6 +114,7 @@ static void cc_function_free(CCFunction *fn)
     fn->instruction_capacity = 0;
     fn->return_type = CC_TYPE_VOID;
     fn->is_varargs = false;
+    fn->is_noreturn = false;
 }
 
 static void cc_global_free(CCGlobal *global)
@@ -293,6 +294,7 @@ CCExtern *cc_module_add_extern(CCModule *module, const char *name)
     ext->name = cc_strdup(name);
     ext->return_type = CC_TYPE_VOID;
     ext->is_varargs = false;
+    ext->is_noreturn = false;
     return ext;
 }
 
@@ -332,6 +334,7 @@ CCFunction *cc_module_add_function(CCModule *module, const char *name)
     fn->name = cc_strdup(name);
     fn->return_type = CC_TYPE_VOID;
     fn->is_varargs = false;
+    fn->is_noreturn = false;
     return fn;
 }
 

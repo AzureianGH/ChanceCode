@@ -131,6 +131,7 @@ typedef struct {
     CCValueType *param_types;
     size_t param_count;
     bool is_varargs;
+    bool is_noreturn;
 } CCExtern;
 
 struct CCInstruction {
@@ -225,6 +226,7 @@ typedef struct {
     char *name;
     CCValueType return_type;
     bool is_varargs;
+    bool is_noreturn;
     CCValueType *param_types;
     size_t param_count;
     CCValueType *local_types;

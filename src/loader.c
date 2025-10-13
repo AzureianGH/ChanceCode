@@ -13,7 +13,13 @@ typedef struct LoaderState {
     CCDiagnosticSink *sink;
     size_t line;
     size_t string_counter;
+    char **pending_noreturn;
+    size_t pending_noreturn_count;
+    size_t pending_noreturn_capacity;
 } LoaderState;
+
+static CCFunction *find_function(CCModule *module, const char *name);
+static char *duplicate_token(const char *token);
 
 static void loader_diag(LoaderState *st, CCDiagnosticSeverity severity, size_t line, const char *fmt, ...)
 {
@@ -32,6 +38,77 @@ static void loader_diag(LoaderState *st, CCDiagnosticSeverity severity, size_t l
     diag.column = 0;
     diag.message = buffer;
     st->sink->callback(&diag, st->sink->userdata);
+}
+
+static void pending_noreturn_destroy(LoaderState *st)
+{
+    if (!st || !st->pending_noreturn)
+        return;
+    for (size_t i = 0; i < st->pending_noreturn_count; ++i)
+        free(st->pending_noreturn[i]);
+    free(st->pending_noreturn);
+    st->pending_noreturn = NULL;
+    st->pending_noreturn_count = 0;
+    st->pending_noreturn_capacity = 0;
+}
+
+static bool mark_symbol_noreturn(LoaderState *st, const char *name)
+{
+    if (!st || !name)
+        return false;
+    CCExtern *ext = cc_module_find_extern(st->module, name);
+    if (ext)
+    {
+        ext->is_noreturn = true;
+        return true;
+    }
+    CCFunction *fn = find_function(st->module, name);
+    if (fn)
+    {
+        fn->is_noreturn = true;
+        return true;
+    }
+    return false;
+}
+
+static bool pending_noreturn_add(LoaderState *st, const char *name)
+{
+    if (!st || !name || *name == '\0')
+        return false;
+    if (st->pending_noreturn_count == st->pending_noreturn_capacity)
+    {
+        size_t new_cap = st->pending_noreturn_capacity ? st->pending_noreturn_capacity * 2 : 4;
+        char **new_list = (char **)realloc(st->pending_noreturn, new_cap * sizeof(char *));
+        if (!new_list)
+            return false;
+        st->pending_noreturn = new_list;
+        st->pending_noreturn_capacity = new_cap;
+    }
+    char *copy = duplicate_token(name);
+    if (!copy)
+        return false;
+    st->pending_noreturn[st->pending_noreturn_count++] = copy;
+    return true;
+}
+
+static void resolve_pending_noreturn(LoaderState *st, const char *name)
+{
+    if (!st || !name)
+        return;
+    if (!st->pending_noreturn || st->pending_noreturn_count == 0)
+        return;
+    for (size_t i = 0; i < st->pending_noreturn_count; ++i)
+    {
+        if (strcmp(st->pending_noreturn[i], name) == 0)
+        {
+            mark_symbol_noreturn(st, name);
+            free(st->pending_noreturn[i]);
+            st->pending_noreturn_count--;
+            memmove(&st->pending_noreturn[i], &st->pending_noreturn[i + 1],
+                    (st->pending_noreturn_count - i) * sizeof(char *));
+            break;
+        }
+    }
 }
 
 static void reset_global_init(CCGlobalInit *init)
@@ -701,11 +778,17 @@ static bool parse_extern(LoaderState *st, char *line)
         {
             ext->is_varargs = true;
         }
+        else if (strcmp(token, "no-return") == 0 || strcmp(token, "noreturn") == 0)
+        {
+            ext->is_noreturn = true;
+        }
         else
         {
             loader_diag(st, CC_DIAG_WARNING, st->line, "unknown extern attribute '%s'", token);
         }
     }
+
+    resolve_pending_noreturn(st, name);
 
     return true;
 }
@@ -1423,6 +1506,44 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             continue;
         }
 
+        if (strncmp(line, ".no-return", 10) == 0)
+        {
+            char *cursor = line + 10;
+            while (*cursor && isspace((unsigned char)*cursor))
+                ++cursor;
+            if (*cursor == '\0')
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, ".no-return requires a symbol name");
+                success = false;
+                break;
+            }
+            char *name = cursor;
+            while (*cursor && !isspace((unsigned char)*cursor))
+                ++cursor;
+            if (*cursor)
+            {
+                *cursor++ = '\0';
+                while (*cursor && isspace((unsigned char)*cursor))
+                    ++cursor;
+                if (*cursor != '\0')
+                {
+                    loader_diag(&st, CC_DIAG_ERROR, st.line, "unexpected tokens after .no-return symbol");
+                    success = false;
+                    break;
+                }
+            }
+            if (!mark_symbol_noreturn(&st, name))
+            {
+                if (!pending_noreturn_add(&st, name))
+                {
+                    loader_diag(&st, CC_DIAG_ERROR, st.line, "failed to record .no-return for '%s'", name);
+                    success = false;
+                    break;
+                }
+            }
+            continue;
+        }
+
         if (strncmp(line, ".func", 5) == 0)
         {
             if (current_fn)
@@ -1520,6 +1641,10 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
                 {
                     current_fn->is_varargs = true;
                 }
+                else if (strcmp(token, "no-return") == 0 || strcmp(token, "noreturn") == 0)
+                {
+                    current_fn->is_noreturn = true;
+                }
                 else
                 {
                     loader_diag(&st, CC_DIAG_WARNING, st.line, "unknown function attribute '%s'", token);
@@ -1528,6 +1653,8 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
 
             if (!success)
                 break;
+
+            resolve_pending_noreturn(&st, name);
 
             continue;
         }

@@ -1,3 +1,0 @@
-"E:\Program Files\CMake\bin\cmake.exe" -E rm -f CMakeFiles\chancecodec.dir/objects.a
-E:\w64devkit\w64devkit\bin\ar.exe qc CMakeFiles\chancecodec.dir/objects.a @CMakeFiles\chancecodec.dir\objects1.rsp
-E:\w64devkit\w64devkit\bin\cc.exe -O3 -DNDEBUG -Wl,--whole-archive CMakeFiles\chancecodec.dir/objects.a -Wl,--no-whole-archive -o chancecodec.exe -Wl,--out-implib,libchancecodec.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\chancecodec.dir\linkLibs.rsp

@@ -93,9 +93,20 @@ static const X86Syntax kGasSyntax = {
     .needs_intel_syntax = true,
 };
 
-typedef struct {
+typedef enum
+{
+    STACK_LOC_NONE = 0,
+    STACK_LOC_RAX,
+    STACK_LOC_R10,
+    STACK_LOC_R11,
+    STACK_LOC_STACK,
+} StackLocation;
+
+typedef struct
+{
     CCValueType type;
     bool is_unsigned;
+    StackLocation location;
 } StackValue;
 
 typedef struct {
@@ -142,6 +153,10 @@ typedef struct {
     size_t local_count;
     size_t frame_size;
     bool saw_return;
+    bool reg_r10_in_use;
+    bool reg_r11_in_use;
+    bool use_frame;
+    bool terminated;
 } X86FunctionContext;
 
 static size_t align_to(size_t value, size_t alignment)
@@ -279,6 +294,22 @@ static bool module_has_function(const CCModule *module, const char *name)
     return false;
 }
 
+static bool module_symbol_is_noreturn(const CCModule *module, const char *name)
+{
+    if (!module || !name)
+        return false;
+    const CCExtern *ext = cc_module_find_extern_const(module, name);
+    if (ext && ext->is_noreturn)
+        return true;
+    for (size_t i = 0; i < module->function_count; ++i)
+    {
+        const CCFunction *fn = &module->functions[i];
+        if (fn->name && strcmp(fn->name, name) == 0)
+            return fn->is_noreturn;
+    }
+    return false;
+}
+
 static const CCGlobal *module_find_global(const CCModule *module, const char *name)
 {
     if (!module || !name)
@@ -357,6 +388,7 @@ static bool function_stack_push(X86FunctionContext *ctx, CCValueType type, bool 
         return false;
     ctx->stack[ctx->stack_size].type = type;
     ctx->stack[ctx->stack_size].is_unsigned = is_unsigned;
+    ctx->stack[ctx->stack_size].location = STACK_LOC_NONE;
     ++ctx->stack_size;
     ++ctx->stack_depth;
     return true;
@@ -378,6 +410,79 @@ static StackValue *function_stack_peek(X86FunctionContext *ctx, size_t index_fro
     if (!ctx || index_from_top >= ctx->stack_size)
         return NULL;
     return &ctx->stack[ctx->stack_size - 1 - index_from_top];
+}
+
+static void x86_release_location(X86FunctionContext *ctx, StackLocation loc)
+{
+    if (!ctx)
+        return;
+    if (loc == STACK_LOC_R10)
+        ctx->reg_r10_in_use = false;
+    else if (loc == STACK_LOC_R11)
+        ctx->reg_r11_in_use = false;
+}
+
+static void x86_move_top_from_rax(X86FunctionContext *ctx)
+{
+    if (!ctx)
+        return;
+    StackValue *top = function_stack_peek(ctx, 0);
+    if (!top || top->location != STACK_LOC_RAX)
+        return;
+
+    if (!ctx->reg_r10_in_use)
+    {
+        fprintf(ctx->out, "    mov r10, rax\n");
+        top->location = STACK_LOC_R10;
+        ctx->reg_r10_in_use = true;
+    }
+    else if (!ctx->reg_r11_in_use)
+    {
+        fprintf(ctx->out, "    mov r11, rax\n");
+        top->location = STACK_LOC_R11;
+        ctx->reg_r11_in_use = true;
+    }
+    else
+    {
+        fprintf(ctx->out, "    push rax\n");
+        top->location = STACK_LOC_STACK;
+    }
+}
+
+static void x86_ensure_rax_available(X86FunctionContext *ctx)
+{
+    if (!ctx)
+        return;
+    x86_move_top_from_rax(ctx);
+}
+
+static void x86_flush_virtual_stack(X86FunctionContext *ctx)
+{
+    if (!ctx)
+        return;
+    for (size_t i = 0; i < ctx->stack_size; ++i)
+    {
+        StackValue *value = &ctx->stack[i];
+        switch (value->location)
+        {
+        case STACK_LOC_RAX:
+            fprintf(ctx->out, "    push rax\n");
+            value->location = STACK_LOC_STACK;
+            break;
+        case STACK_LOC_R10:
+            fprintf(ctx->out, "    push r10\n");
+            value->location = STACK_LOC_STACK;
+            ctx->reg_r10_in_use = false;
+            break;
+        case STACK_LOC_R11:
+            fprintf(ctx->out, "    push r11\n");
+            value->location = STACK_LOC_STACK;
+            ctx->reg_r11_in_use = false;
+            break;
+        default:
+            break;
+        }
+    }
 }
 
 static bool ensure_param_offsets(X86FunctionContext *ctx)
@@ -560,7 +665,30 @@ static bool emit_pop_to(FILE *out, X86FunctionContext *ctx, const char *reg, Sta
 {
     if (!function_stack_pop(ctx, value))
         return false;
-    fprintf(out, "    pop %s\n", reg);
+
+    StackLocation loc = value->location;
+    switch (loc)
+    {
+    case STACK_LOC_STACK:
+        fprintf(out, "    pop %s\n", reg);
+        break;
+    case STACK_LOC_RAX:
+        if (strcmp(reg, "rax") != 0)
+            fprintf(out, "    mov %s, rax\n", reg);
+        break;
+    case STACK_LOC_R10:
+        if (strcmp(reg, "r10") != 0)
+            fprintf(out, "    mov %s, r10\n", reg);
+        ctx->reg_r10_in_use = false;
+        break;
+    case STACK_LOC_R11:
+        if (strcmp(reg, "r11") != 0)
+            fprintf(out, "    mov %s, r11\n", reg);
+        ctx->reg_r11_in_use = false;
+        break;
+    default:
+        break;
+    }
     return true;
 }
 
@@ -568,15 +696,39 @@ static bool emit_pop_to_rax(FILE *out, X86FunctionContext *ctx, StackValue *valu
 {
     if (!function_stack_pop(ctx, value))
         return false;
-    fprintf(out, "    pop rax\n");
+
+    switch (value->location)
+    {
+    case STACK_LOC_STACK:
+        fprintf(out, "    pop rax\n");
+        break;
+    case STACK_LOC_R10:
+        fprintf(out, "    mov rax, r10\n");
+        ctx->reg_r10_in_use = false;
+        break;
+    case STACK_LOC_R11:
+        fprintf(out, "    mov rax, r11\n");
+        ctx->reg_r11_in_use = false;
+        break;
+    case STACK_LOC_RAX:
+    case STACK_LOC_NONE:
+        break;
+    }
+    value->location = STACK_LOC_RAX;
     return true;
 }
 
 static bool emit_push_rax(FILE *out, X86FunctionContext *ctx, CCValueType type, bool is_unsigned)
 {
+    (void)out;
     if (!function_stack_push(ctx, type, is_unsigned))
         return false;
-    fprintf(out, "    push rax\n");
+    StackValue *slot = function_stack_peek(ctx, 0);
+    if (!slot)
+        return false;
+    slot->type = type;
+    slot->is_unsigned = is_unsigned;
+    slot->location = STACK_LOC_RAX;
     return true;
 }
 
@@ -584,6 +736,7 @@ static bool emit_load_const(X86FunctionContext *ctx, const CCInstruction *ins)
 {
     const CCValueType type = ins->data.constant.type;
     bool is_unsigned = ins->data.constant.is_unsigned;
+    x86_ensure_rax_available(ctx);
     if (type == CC_TYPE_F32 || type == CC_TYPE_F64)
     {
         emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "x86 backend: floating constants not supported yet");
@@ -615,6 +768,7 @@ static bool emit_load_local(X86FunctionContext *ctx, const CCInstruction *ins)
     }
     int32_t offset = ctx->local_offsets[index];
     bool is_unsigned = !cc_value_type_is_signed(ins->data.local.type);
+    x86_ensure_rax_available(ctx);
     if (!emit_load_into_rax_from_rbp(ctx, ins->line, offset, ins->data.local.type, is_unsigned))
         return false;
     return emit_push_rax(ctx->out, ctx, ins->data.local.type, is_unsigned);
@@ -654,7 +808,21 @@ static bool emit_drop(X86FunctionContext *ctx, const CCInstruction *ins)
                   expected ? expected : "<unknown>", actual ? actual : "<unknown>");
         return false;
     }
-    fprintf(ctx->out, "    add rsp, 8\n");
+    switch (value.location)
+    {
+    case STACK_LOC_STACK:
+        fprintf(ctx->out, "    add rsp, 8\n");
+        break;
+    case STACK_LOC_R10:
+        ctx->reg_r10_in_use = false;
+        break;
+    case STACK_LOC_R11:
+        ctx->reg_r11_in_use = false;
+        break;
+    case STACK_LOC_RAX:
+    case STACK_LOC_NONE:
+        break;
+    }
     return true;
 }
 
@@ -666,6 +834,7 @@ static bool emit_addr_local(X86FunctionContext *ctx, const CCInstruction *ins)
         emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "addr_local index %u out of range", index);
         return false;
     }
+    x86_ensure_rax_available(ctx);
     fprintf(ctx->out, "    lea rax, [rbp%+d]\n", ctx->local_offsets[index]);
     return emit_push_rax(ctx->out, ctx, CC_TYPE_PTR, true);
 }
@@ -679,6 +848,7 @@ static bool emit_load_param(X86FunctionContext *ctx, const CCInstruction *ins)
         return false;
     }
     bool is_unsigned = !cc_value_type_is_signed(ins->data.param.type);
+    x86_ensure_rax_available(ctx);
     if (!emit_load_into_rax_from_rbp(ctx, ins->line, ctx->param_offsets[index], ins->data.param.type, is_unsigned))
         return false;
     return emit_push_rax(ctx->out, ctx, ins->data.param.type, is_unsigned);
@@ -692,6 +862,7 @@ static bool emit_addr_param(X86FunctionContext *ctx, const CCInstruction *ins)
         emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "addr_param index %u out of range", index);
         return false;
     }
+    x86_ensure_rax_available(ctx);
     fprintf(ctx->out, "    lea rax, [rbp%+d]\n", ctx->param_offsets[index]);
     return emit_push_rax(ctx->out, ctx, CC_TYPE_PTR, true);
 }
@@ -703,6 +874,7 @@ static bool emit_load_global(X86FunctionContext *ctx, const CCInstruction *ins)
     bool is_unsigned = !cc_value_type_is_signed(ins->data.global.type);
     char addr[128];
     format_rip_relative_operand(ctx->syntax, addr, sizeof(addr), symbol);
+    x86_ensure_rax_available(ctx);
     switch (ins->data.global.type)
     {
     case CC_TYPE_I1:
@@ -773,6 +945,7 @@ static bool emit_addr_global(X86FunctionContext *ctx, const CCInstruction *ins)
 {
     char addr[128];
     format_rip_relative_operand(ctx->syntax, addr, sizeof(addr), ins->data.global.symbol);
+    x86_ensure_rax_available(ctx);
     fprintf(ctx->out, "    lea rax, %s\n", addr);
     return emit_push_rax(ctx->out, ctx, CC_TYPE_PTR, true);
 }
@@ -787,6 +960,7 @@ static bool emit_load_indirect(X86FunctionContext *ctx, const CCInstruction *ins
     }
     (void)pointer;
     bool is_unsigned = ins->data.memory.is_unsigned;
+    x86_ensure_rax_available(ctx);
     switch (ins->data.memory.type)
     {
     case CC_TYPE_I1:
@@ -1029,6 +1203,7 @@ static bool emit_stack_alloc(X86FunctionContext *ctx, const CCInstruction *ins)
     uint32_t aligned = (uint32_t)align_to(size, alignment);
     if (aligned > 0)
         fprintf(ctx->out, "    sub rsp, %u\n", aligned);
+    x86_ensure_rax_available(ctx);
     fprintf(ctx->out, "    mov rax, rsp\n");
     return emit_push_rax(ctx->out, ctx, CC_TYPE_PTR, true);
 }
@@ -1049,6 +1224,7 @@ static bool emit_branch(X86FunctionContext *ctx, const CCInstruction *ins)
 
 static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
 {
+    x86_flush_virtual_stack(ctx);
     size_t arg_count = ins->data.call.arg_count;
     if (ctx->stack_size < arg_count)
     {
@@ -1058,14 +1234,23 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
 
     const StackValue *args = ctx->stack + (ctx->stack_size - arg_count);
     size_t stack_args = arg_count > 4 ? arg_count - 4 : 0;
-    size_t call_area = X86_SHADOW_SPACE + stack_args * 8;
-    if (call_area > 0)
-        fprintf(ctx->out, "    sub rsp, %zu\n", call_area);
+    size_t base_call_area = X86_SHADOW_SPACE + stack_args * 8;
+    size_t spill_bytes = ctx->stack_size * 8;
+    size_t prologue_bytes = ctx->use_frame ? ctx->frame_size + 8 : 0;
+    size_t entry_bias = 8; // return address pushed by caller
+    size_t current_offset = entry_bias + prologue_bytes + spill_bytes;
+    size_t total_for_alignment = current_offset + base_call_area;
+    size_t remainder = total_for_alignment % X86_STACK_ALIGNMENT;
+    size_t align_padding = remainder ? (X86_STACK_ALIGNMENT - remainder) : 0;
+    size_t call_frame_size = base_call_area + align_padding;
+    bool is_noreturn = module_symbol_is_noreturn(ctx->module->module, ins->data.call.symbol);
+    if (call_frame_size > 0)
+        fprintf(ctx->out, "    sub rsp, %zu\n", call_frame_size);
 
     static const char *reg64[] = {"rcx", "rdx", "r8", "r9"};
     for (size_t i = 0; i < arg_count; ++i)
     {
-        size_t offset = call_area + (arg_count - 1 - i) * 8;
+        size_t offset = call_frame_size + (arg_count - 1 - i) * 8;
         CCValueType arg_type = ins->data.call.arg_types ? ins->data.call.arg_types[i] : CC_TYPE_I64;
         bool is_unsigned = !cc_value_type_is_signed(arg_type) && args[i].is_unsigned;
         switch (arg_type)
@@ -1103,21 +1288,35 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
         }
         else
         {
-            size_t slot = X86_SHADOW_SPACE + (i - 4) * 8;
+            size_t slot = align_padding + X86_SHADOW_SPACE + (i - 4) * 8;
             fprintf(ctx->out, "    mov %s [rsp + %zu], rax\n", ctx->syntax->qword_mem_keyword, slot);
         }
     }
 
     fprintf(ctx->out, "    call %s\n", ins->data.call.symbol);
 
-    if (call_area > 0)
-        fprintf(ctx->out, "    add rsp, %zu\n", call_area);
+    if (ctx->stack_size >= arg_count)
+        ctx->stack_size -= arg_count;
+    else
+        ctx->stack_size = 0;
+    ctx->stack_depth -= (int)arg_count;
+    if (ctx->stack_depth < 0)
+        ctx->stack_depth = 0;
+    if (is_noreturn)
+    {
+        ctx->stack_size = 0;
+        ctx->stack_depth = 0;
+        ctx->terminated = true;
+        ctx->saw_return = true;
+        return true;
+    }
+
+    if (call_frame_size > 0)
+        fprintf(ctx->out, "    add rsp, %zu\n", call_frame_size);
     if (arg_count > 0)
     {
         fprintf(ctx->out, "    add rsp, %zu\n", arg_count * 8);
-        ctx->stack_depth -= (int)arg_count;
     }
-    ctx->stack_size -= arg_count;
 
     if (ins->data.call.return_type != CC_TYPE_VOID)
     {
@@ -1144,7 +1343,8 @@ static bool emit_ret(X86FunctionContext *ctx, const CCInstruction *ins)
     {
         fprintf(ctx->out, "    xor eax, eax\n");
     }
-    fprintf(ctx->out, "    leave\n");
+    if (ctx->use_frame)
+        fprintf(ctx->out, "    leave\n");
     fprintf(ctx->out, "    ret\n");
     ctx->stack_depth = 0;
     ctx->saw_return = true;
@@ -1153,6 +1353,10 @@ static bool emit_ret(X86FunctionContext *ctx, const CCInstruction *ins)
 
 static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
 {
+    if (ctx->terminated)
+    {
+        return true;
+    }
     switch (ins->kind)
     {
     case CC_INSTR_CONST:
@@ -1164,6 +1368,7 @@ static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
             return false;
         char addr[128];
         format_rip_relative_operand(ctx->syntax, addr, sizeof(addr), label);
+        x86_ensure_rax_available(ctx);
         fprintf(ctx->out, "    lea rax, %s\n", addr);
         return emit_push_rax(ctx->out, ctx, CC_TYPE_PTR, true);
     }
@@ -1224,6 +1429,8 @@ static void emit_function_prologue(X86FunctionContext *ctx)
 {
     fprintf(ctx->out, "%s %s\n", ctx->syntax->global_directive, ctx->fn->name);
     fprintf(ctx->out, "%s:\n", ctx->fn->name);
+    if (!ctx->use_frame)
+        return;
     fprintf(ctx->out, "    push rbp\n");
     fprintf(ctx->out, "    mov rbp, rsp\n");
     if (ctx->frame_size > 0)
@@ -1291,6 +1498,25 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
         return false;
     }
 
+    ctx.use_frame = (ctx.frame_size > 0) || (ctx.param_count > 0);
+    if (!ctx.use_frame)
+    {
+        for (size_t i = 0; i < fn->instruction_count; ++i)
+        {
+            CCInstrKind kind = fn->instructions[i].kind;
+            if (kind == CC_INSTR_STACK_ALLOC ||
+                kind == CC_INSTR_LOAD_PARAM ||
+                kind == CC_INSTR_ADDR_PARAM ||
+                kind == CC_INSTR_LOAD_LOCAL ||
+                kind == CC_INSTR_STORE_LOCAL ||
+                kind == CC_INSTR_ADDR_LOCAL)
+            {
+                ctx.use_frame = true;
+                break;
+            }
+        }
+    }
+
     emit_function_prologue(&ctx);
 
     for (size_t i = 0; i < fn->instruction_count; ++i)
@@ -1305,7 +1531,8 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
     if (!ctx.saw_return)
     {
         fprintf(ctx.out, "    xor eax, eax\n");
-        fprintf(ctx.out, "    leave\n");
+        if (ctx.use_frame)
+            fprintf(ctx.out, "    leave\n");
         fprintf(ctx.out, "    ret\n");
     }
 
