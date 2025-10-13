@@ -10,7 +10,7 @@
 void cc_register_builtin_backends(void);
 
 static void print_usage(void) {
-    fprintf(stderr, "Usage: chancecodec <input.ccb> [-O0|-O1|-O2] [--backend NAME] [--output PATH] [--option key=value] [--list-backends]\n");
+    fprintf(stderr, "Usage: ccb <input.ccb> [-O0|-O1|-O2] [--backend NAME] [--output PATH] [--option key=value] [--list-backends]\n");
 }
 
 static bool parse_option_assignment(const char *arg, CCBackendOption *out_option) {
