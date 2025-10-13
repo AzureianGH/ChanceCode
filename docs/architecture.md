@@ -12,10 +12,10 @@ ChanceCode is an intermediate compiler that translates ChanceCode bytecode (CC b
 ## High-Level Pipeline
 
 ```
-           +---------------+       +---------------------+       +--------------------+
-           |  CC Bytecode  |  -->  |    Bytecode IR      |  -->  |   Selected Backend  |
-           |   (.ccb file) |       | (module/function)   |       | (e.g. x86, wasm)    |
-           +---------------+       +---------------------+       +--------------------+
+           +---------------+       +-------------------+       +--------------------+
+           |  CC Bytecode  |  -->  |    Bytecode IR    |  -->  |  Selected Backend  |
+           |  (.ccb file)  |       | (module/function) |       |  (e.g. x86, wasm)  |
+           +---------------+       +-------------------+       +--------------------+
 ```
 
 1. **Loader** reads a `.ccb` textual file and builds an in-memory `CCModule`.
