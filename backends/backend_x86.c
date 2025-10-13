@@ -360,6 +360,25 @@ static bool module_symbol_is_noreturn(const CCModule *module, const char *name)
     return false;
 }
 
+static bool module_symbol_is_varargs(const CCModule *module, const char *name)
+{
+    if (!module || !name)
+        return false;
+
+    const CCExtern *ext = cc_module_find_extern_const(module, name);
+    if (ext && ext->is_varargs)
+        return true;
+
+    for (size_t i = 0; i < module->function_count; ++i)
+    {
+        const CCFunction *fn = &module->functions[i];
+        if (fn->name && strcmp(fn->name, name) == 0)
+            return fn->is_varargs;
+    }
+
+    return false;
+}
+
 static const CCGlobal *module_find_global(const CCModule *module, const char *name)
 {
     if (!module || !name)
@@ -1296,6 +1315,7 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     size_t align_padding = remainder ? (X86_STACK_ALIGNMENT - remainder) : 0;
     size_t call_frame_size = base_call_area + align_padding;
     bool is_noreturn = module_symbol_is_noreturn(ctx->module->module, ins->data.call.symbol);
+    bool is_varargs = module_symbol_is_varargs(ctx->module->module, ins->data.call.symbol);
     if (call_frame_size > 0)
         fprintf(ctx->out, "    sub rsp, %zu\n", call_frame_size);
 
@@ -1343,6 +1363,9 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
             fprintf(ctx->out, "    mov %s [rsp + %zu], rax\n", ctx->syntax->qword_mem_keyword, slot);
         }
     }
+
+    if (is_varargs && ctx->abi == &kX86AbiSystemV)
+        fprintf(ctx->out, "    xor eax, eax\n");
 
     fprintf(ctx->out, "    call %s\n", ins->data.call.symbol);
 
