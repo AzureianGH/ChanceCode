@@ -11,7 +11,6 @@
 #include <string.h>
 
 #define X86_STACK_ALIGNMENT 16
-#define X86_SHADOW_SPACE 32
 
 typedef enum {
     X86_ASM_NASM = 0,
@@ -42,6 +41,17 @@ typedef struct {
     const char *rip_relative_operand_fmt;
     bool needs_intel_syntax;
 } X86Syntax;
+
+typedef struct
+{
+    const char *name;
+    size_t int_register_count;
+    size_t shadow_space_bytes;
+    const char *reg8[6];
+    const char *reg16[6];
+    const char *reg32[6];
+    const char *reg64[6];
+} X86ABIInfo;
 
 static const X86Syntax kNasmSyntax = {
     .flavor = X86_ASM_NASM,
@@ -93,6 +103,26 @@ static const X86Syntax kGasSyntax = {
     .needs_intel_syntax = true,
 };
 
+static const X86ABIInfo kX86AbiWin64 = {
+    .name = "windows",
+    .int_register_count = 4,
+    .shadow_space_bytes = 32,
+    .reg8 = {"cl", "dl", "r8b", "r9b", NULL, NULL},
+    .reg16 = {"cx", "dx", "r8w", "r9w", NULL, NULL},
+    .reg32 = {"ecx", "edx", "r8d", "r9d", NULL, NULL},
+    .reg64 = {"rcx", "rdx", "r8", "r9", NULL, NULL},
+};
+
+static const X86ABIInfo kX86AbiSystemV = {
+    .name = "linux",
+    .int_register_count = 6,
+    .shadow_space_bytes = 0,
+    .reg8 = {"dil", "sil", "dl", "cl", "r8b", "r9b"},
+    .reg16 = {"di", "si", "dx", "cx", "r8w", "r9w"},
+    .reg32 = {"edi", "esi", "edx", "ecx", "r8d", "r9d"},
+    .reg64 = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"},
+};
+
 typedef enum
 {
     STACK_LOC_NONE = 0,
@@ -135,6 +165,7 @@ typedef struct {
     X86StringSet externs;
     size_t string_counter;
     const X86Syntax *syntax;
+    const X86ABIInfo *abi;
 } X86ModuleContext;
 
 typedef struct {
@@ -143,6 +174,7 @@ typedef struct {
     FILE *out;
     CCDiagnosticSink *sink;
     const X86Syntax *syntax;
+    const X86ABIInfo *abi;
     StackValue *stack;
     size_t stack_size;
     size_t stack_capacity;
@@ -280,6 +312,24 @@ static bool string_set_add(X86StringSet *set, const char *value)
     memcpy(copy, value, len + 1);
     set->items[set->count++] = copy;
     return true;
+}
+
+static bool equals_ignore_case(const char *a, const char *b)
+{
+    if (!a || !b)
+        return false;
+    while (*a && *b)
+    {
+        unsigned char ca = (unsigned char)*a;
+        unsigned char cb = (unsigned char)*b;
+        ca = (unsigned char)tolower(ca);
+        cb = (unsigned char)tolower(cb);
+        if (ca != cb)
+            return false;
+        ++a;
+        ++b;
+    }
+    return *a == '\0' && *b == '\0';
 }
 
 static bool module_has_function(const CCModule *module, const char *name)
@@ -1233,8 +1283,10 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     }
 
     const StackValue *args = ctx->stack + (ctx->stack_size - arg_count);
-    size_t stack_args = arg_count > 4 ? arg_count - 4 : 0;
-    size_t base_call_area = X86_SHADOW_SPACE + stack_args * 8;
+    const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
+    size_t reg_count = abi->int_register_count;
+    size_t stack_args = arg_count > reg_count ? arg_count - reg_count : 0;
+    size_t base_call_area = abi->shadow_space_bytes + stack_args * 8;
     size_t spill_bytes = ctx->stack_size * 8;
     size_t prologue_bytes = ctx->use_frame ? ctx->frame_size + 8 : 0;
     size_t entry_bias = 8; // return address pushed by caller
@@ -1247,7 +1299,6 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     if (call_frame_size > 0)
         fprintf(ctx->out, "    sub rsp, %zu\n", call_frame_size);
 
-    static const char *reg64[] = {"rcx", "rdx", "r8", "r9"};
     for (size_t i = 0; i < arg_count; ++i)
     {
         size_t offset = call_frame_size + (arg_count - 1 - i) * 8;
@@ -1282,13 +1333,13 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
             break;
         }
 
-        if (i < 4)
+        if (i < reg_count)
         {
-            fprintf(ctx->out, "    mov %s, rax\n", reg64[i]);
+            fprintf(ctx->out, "    mov %s, rax\n", abi->reg64[i]);
         }
         else
         {
-            size_t slot = align_padding + X86_SHADOW_SPACE + (i - 4) * 8;
+            size_t slot = align_padding + abi->shadow_space_bytes + (i - reg_count) * 8;
             fprintf(ctx->out, "    mov %s [rsp + %zu], rax\n", ctx->syntax->qword_mem_keyword, slot);
         }
     }
@@ -1436,41 +1487,39 @@ static void emit_function_prologue(X86FunctionContext *ctx)
     if (ctx->frame_size > 0)
         fprintf(ctx->out, "    sub rsp, %zu\n", ctx->frame_size);
 
-    static const char *param_reg8[] = {"cl", "dl", "r8b", "r9b"};
-    static const char *param_reg16[] = {"cx", "dx", "r8w", "r9w"};
-    static const char *param_reg32[] = {"ecx", "edx", "r8d", "r9d"};
-    static const char *param_reg64[] = {"rcx", "rdx", "r8", "r9"};
+    const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
+    size_t reg_count = abi->int_register_count;
 
     for (size_t i = 0; i < ctx->param_count; ++i)
     {
         CCValueType type = ctx->fn->param_types ? ctx->fn->param_types[i] : CC_TYPE_I64;
         int32_t offset = ctx->param_offsets[i];
-        if (i < 4)
+        if (i < reg_count)
         {
             switch (type)
             {
             case CC_TYPE_I1:
             case CC_TYPE_U8:
             case CC_TYPE_I8:
-                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->byte_mem_keyword, offset, param_reg8[i]);
+                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->byte_mem_keyword, offset, abi->reg8[i]);
                 break;
             case CC_TYPE_I16:
             case CC_TYPE_U16:
-                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->word_mem_keyword, offset, param_reg16[i]);
+                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->word_mem_keyword, offset, abi->reg16[i]);
                 break;
             case CC_TYPE_I32:
             case CC_TYPE_U32:
             case CC_TYPE_F32:
-                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->dword_mem_keyword, offset, param_reg32[i]);
+                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->dword_mem_keyword, offset, abi->reg32[i]);
                 break;
             default:
-                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->qword_mem_keyword, offset, param_reg64[i]);
+                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->qword_mem_keyword, offset, abi->reg64[i]);
                 break;
             }
         }
         else
         {
-            size_t stack_offset = 16 + (i - 4) * 8;
+            size_t stack_offset = 16 + abi->shadow_space_bytes + (i - reg_count) * 8;
             fprintf(ctx->out, "    mov rax, %s [rbp + %zu]\n", ctx->syntax->qword_mem_keyword, stack_offset);
             emit_store_from_rax_to_rbp(ctx, 0, offset, type);
         }
@@ -1486,6 +1535,7 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
     ctx.out = module_ctx->out;
     ctx.sink = module_ctx->sink;
     ctx.syntax = module_ctx->syntax;
+    ctx.abi = module_ctx->abi;
 
     if (!ensure_param_offsets(&ctx))
     {
@@ -1673,6 +1723,29 @@ static bool emit_module(const CCBackend *backend,
     ctx.module = module;
     ctx.sink = sink;
     ctx.syntax = backend && backend->userdata ? (const X86Syntax *)backend->userdata : &kNasmSyntax;
+    const char *target_os_opt = backend_option_get(options, "target-os");
+    if (target_os_opt)
+    {
+        if (equals_ignore_case(target_os_opt, "windows"))
+            ctx.abi = &kX86AbiWin64;
+        else if (equals_ignore_case(target_os_opt, "linux"))
+            ctx.abi = &kX86AbiSystemV;
+        else
+        {
+            emit_diag(sink, CC_DIAG_ERROR, 0, "unknown target-os '%s' (expected windows or linux)", target_os_opt);
+            if (out != stdout)
+                fclose(out);
+            return false;
+        }
+    }
+    else
+    {
+#ifdef _WIN32
+        ctx.abi = &kX86AbiWin64;
+#else
+        ctx.abi = &kX86AbiSystemV;
+#endif
+    }
 
     if (!collect_externs(&ctx))
     {
