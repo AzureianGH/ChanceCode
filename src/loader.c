@@ -99,7 +99,7 @@ static void resolve_pending_noreturn(LoaderState *st, const char *name)
         return;
     for (size_t i = 0; i < st->pending_noreturn_count; ++i)
     {
-        if (strcmp(st->pending_noreturn[i], name) == 0)
+        if (st->pending_noreturn[i] && strcmp(st->pending_noreturn[i], name) == 0)
         {
             mark_symbol_noreturn(st, name);
             free(st->pending_noreturn[i]);
@@ -1435,7 +1435,7 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
     }
 
     bool success = true;
-    LoaderState st;
+    LoaderState st = { 0 };
     st.path = path;
     st.module = module;
     st.sink = sink;
@@ -1743,6 +1743,8 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
     }
 
     fclose(file);
+
+    pending_noreturn_destroy(&st);
 
     if (!success)
         cc_module_free(module);
