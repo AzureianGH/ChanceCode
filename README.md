@@ -29,11 +29,12 @@ chancecodec <input.ccb> --backend x86 --output output.asm
 
 Flags:
 
-- `--backend <name>` – selects a backend (defaults to the first registered backend).
-- `--output <path>` – writes backend output to the given path. When omitted, output is printed to stdout.
-- `--option key=value` – forwards arbitrary key/value options to the backend.
-- `--list-backends` – enumerates available backends.
 
+To produce a binary `.ccbin` module that preserves all metadata for downstream tools, pass `--emit-ccbin`:
+
+```
+chancecodec <input.ccb> --emit-ccbin output.ccbin
+```
 ## Adding a Backend
 
 1. Implement an emitter function matching `CCBackendEmitFn`. The function receives a `CCModule`, `CCBackendOptions`, and a diagnostic sink.

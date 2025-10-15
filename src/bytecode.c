@@ -1,5 +1,9 @@
 #include "cc/bytecode.h"
+#include "cc/diagnostics.h"
 
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -784,4 +788,431 @@ void cc_module_optimize(CCModule *module, int opt_level)
             cc_function_prune_dropped_values(fn);
         }
     }
+
+}
+
+static bool cc_write_u8(FILE *out, uint8_t value)
+{
+    return fwrite(&value, 1, 1, out) == 1;
+}
+
+static bool cc_write_u16(FILE *out, uint16_t value)
+{
+    unsigned char buf[2];
+    buf[0] = (unsigned char)(value & 0xFFu);
+    buf[1] = (unsigned char)((value >> 8) & 0xFFu);
+    return fwrite(buf, 1, 2, out) == 2;
+}
+
+static bool cc_write_u32(FILE *out, uint32_t value)
+{
+    unsigned char buf[4];
+    buf[0] = (unsigned char)(value & 0xFFu);
+    buf[1] = (unsigned char)((value >> 8) & 0xFFu);
+    buf[2] = (unsigned char)((value >> 16) & 0xFFu);
+    buf[3] = (unsigned char)((value >> 24) & 0xFFu);
+    return fwrite(buf, 1, 4, out) == 4;
+}
+
+static bool cc_write_u64(FILE *out, uint64_t value)
+{
+    unsigned char buf[8];
+    for (int i = 0; i < 8; ++i)
+        buf[i] = (unsigned char)((value >> (8 * i)) & 0xFFu);
+    return fwrite(buf, 1, 8, out) == 8;
+}
+
+static bool cc_write_s32(FILE *out, int32_t value)
+{
+    return cc_write_u32(out, (uint32_t)value);
+}
+
+static bool cc_write_bool(FILE *out, bool value)
+{
+    return cc_write_u8(out, value ? 1u : 0u);
+}
+
+static bool cc_write_bytes(FILE *out, const void *data, size_t length)
+{
+    if (length == 0)
+        return true;
+    if (!data)
+        return false;
+    return fwrite(data, 1, length, out) == length;
+}
+
+static bool cc_write_size32(FILE *out, size_t value)
+{
+    if (value > UINT32_MAX)
+        return false;
+    return cc_write_u32(out, (uint32_t)value);
+}
+
+static bool cc_write_string(FILE *out, const char *text)
+{
+    size_t len = text ? strlen(text) : 0;
+    if (!cc_write_size32(out, len))
+        return false;
+    return cc_write_bytes(out, text, len);
+}
+
+static bool cc_write_value_type(FILE *out, CCValueType type)
+{
+    return cc_write_s32(out, (int32_t)type);
+}
+
+static bool cc_write_value_type_array(FILE *out, const CCValueType *types, size_t count)
+{
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (!cc_write_value_type(out, types ? types[i] : CC_TYPE_INVALID))
+            return false;
+    }
+    return true;
+}
+
+static bool cc_write_global(FILE *out, const CCGlobal *global)
+{
+    if (!cc_write_string(out, global ? global->name : NULL))
+        return false;
+    if (!cc_write_value_type(out, global ? global->type : CC_TYPE_INVALID))
+        return false;
+    if (!cc_write_bool(out, global && global->is_const))
+        return false;
+    size_t alignment = global ? global->alignment : 0;
+    if (!cc_write_size32(out, alignment))
+        return false;
+
+    CCGlobalInitKind kind = global ? global->init.kind : CC_GLOBAL_INIT_NONE;
+    if (!cc_write_u8(out, (uint8_t)kind))
+        return false;
+
+    if (!global)
+        return true;
+
+    switch (kind)
+    {
+    case CC_GLOBAL_INIT_NONE:
+        return true;
+    case CC_GLOBAL_INIT_INT:
+        return cc_write_u64(out, (uint64_t)global->init.payload.u64);
+    case CC_GLOBAL_INIT_FLOAT:
+    {
+        uint64_t bits = 0;
+        memcpy(&bits, &global->init.payload.f64, sizeof(bits));
+        return cc_write_u64(out, bits);
+    }
+    case CC_GLOBAL_INIT_STRING:
+    {
+        size_t len = global->init.payload.string.length;
+        if (!cc_write_size32(out, len))
+            return false;
+        return cc_write_bytes(out, global->init.payload.string.data, len);
+    }
+    case CC_GLOBAL_INIT_BYTES:
+    {
+        size_t len = global->init.payload.bytes.size;
+        if (!cc_write_size32(out, len))
+            return false;
+        return cc_write_bytes(out, global->init.payload.bytes.data, len);
+    }
+    default:
+        return false;
+    }
+}
+
+static bool cc_write_extern(FILE *out, const CCExtern *ext)
+{
+    if (!cc_write_string(out, ext ? ext->name : NULL))
+        return false;
+    if (!cc_write_value_type(out, ext ? ext->return_type : CC_TYPE_VOID))
+        return false;
+    if (!cc_write_bool(out, ext && ext->is_varargs))
+        return false;
+    if (!cc_write_bool(out, ext && ext->is_noreturn))
+        return false;
+    size_t param_count = ext ? ext->param_count : 0;
+    if (!cc_write_size32(out, param_count))
+        return false;
+    if (param_count > 0 && !cc_write_value_type_array(out, ext->param_types, param_count))
+        return false;
+    return true;
+}
+
+static bool cc_write_instruction(FILE *out, const CCInstruction *ins)
+{
+    if (!cc_write_u8(out, (uint8_t)(ins ? ins->kind : 0)))
+        return false;
+    if (!cc_write_u32(out, ins ? (uint32_t)ins->line : 0))
+        return false;
+
+    if (!ins)
+        return true;
+
+    switch (ins->kind)
+    {
+    case CC_INSTR_CONST:
+    {
+        const CCValueType type = ins->data.constant.type;
+        if (!cc_write_value_type(out, type))
+            return false;
+        if (!cc_write_bool(out, ins->data.constant.is_unsigned))
+            return false;
+        if (!cc_write_bool(out, ins->data.constant.is_null))
+            return false;
+        if (type == CC_TYPE_F32)
+        {
+            uint32_t bits = 0;
+            memcpy(&bits, &ins->data.constant.value.f32, sizeof(bits));
+            if (!cc_write_u32(out, bits))
+                return false;
+        }
+        else if (type == CC_TYPE_F64)
+        {
+            uint64_t bits = 0;
+            memcpy(&bits, &ins->data.constant.value.f64, sizeof(bits));
+            if (!cc_write_u64(out, bits))
+                return false;
+        }
+        else
+        {
+            if (!cc_write_u64(out, ins->data.constant.value.u64))
+                return false;
+        }
+        return true;
+    }
+    case CC_INSTR_CONST_STRING:
+    {
+        size_t len = ins->data.const_string.length;
+        if (!cc_write_size32(out, len))
+            return false;
+        if (!cc_write_bytes(out, ins->data.const_string.bytes, len))
+            return false;
+        if (!cc_write_string(out, ins->data.const_string.label_hint))
+            return false;
+        return true;
+    }
+    case CC_INSTR_LOAD_PARAM:
+    case CC_INSTR_ADDR_PARAM:
+    {
+        if (!cc_write_value_type(out, ins->data.param.type))
+            return false;
+        if (!cc_write_u32(out, ins->data.param.index))
+            return false;
+        return true;
+    }
+    case CC_INSTR_LOAD_LOCAL:
+    case CC_INSTR_STORE_LOCAL:
+    case CC_INSTR_ADDR_LOCAL:
+    {
+        if (!cc_write_value_type(out, ins->data.local.type))
+            return false;
+        if (!cc_write_u32(out, ins->data.local.index))
+            return false;
+        return true;
+    }
+    case CC_INSTR_LOAD_GLOBAL:
+    case CC_INSTR_STORE_GLOBAL:
+    case CC_INSTR_ADDR_GLOBAL:
+    {
+        if (!cc_write_value_type(out, ins->data.global.type))
+            return false;
+        if (!cc_write_string(out, ins->data.global.symbol))
+            return false;
+        return true;
+    }
+    case CC_INSTR_LOAD_INDIRECT:
+    case CC_INSTR_STORE_INDIRECT:
+    {
+        if (!cc_write_value_type(out, ins->data.memory.type))
+            return false;
+        if (!cc_write_bool(out, ins->data.memory.is_unsigned))
+            return false;
+        return true;
+    }
+    case CC_INSTR_BINOP:
+    {
+        if (!cc_write_u8(out, (uint8_t)ins->data.binop.op))
+            return false;
+        if (!cc_write_value_type(out, ins->data.binop.type))
+            return false;
+        if (!cc_write_bool(out, ins->data.binop.is_unsigned))
+            return false;
+        return true;
+    }
+    case CC_INSTR_UNOP:
+    {
+        if (!cc_write_u8(out, (uint8_t)ins->data.unop.op))
+            return false;
+        if (!cc_write_value_type(out, ins->data.unop.type))
+            return false;
+        return true;
+    }
+    case CC_INSTR_COMPARE:
+    {
+        if (!cc_write_u8(out, (uint8_t)ins->data.compare.op))
+            return false;
+        if (!cc_write_value_type(out, ins->data.compare.type))
+            return false;
+        if (!cc_write_bool(out, ins->data.compare.is_unsigned))
+            return false;
+        return true;
+    }
+    case CC_INSTR_CONVERT:
+    {
+        if (!cc_write_u8(out, (uint8_t)ins->data.convert.kind))
+            return false;
+        if (!cc_write_value_type(out, ins->data.convert.from_type))
+            return false;
+        if (!cc_write_value_type(out, ins->data.convert.to_type))
+            return false;
+        return true;
+    }
+    case CC_INSTR_STACK_ALLOC:
+    {
+        if (!cc_write_u32(out, ins->data.stack_alloc.size_bytes))
+            return false;
+        if (!cc_write_u32(out, ins->data.stack_alloc.alignment))
+            return false;
+        return true;
+    }
+    case CC_INSTR_DROP:
+    {
+        if (!cc_write_value_type(out, ins->data.drop.type))
+            return false;
+        return true;
+    }
+    case CC_INSTR_LABEL:
+        return cc_write_string(out, ins->data.label.name);
+    case CC_INSTR_JUMP:
+        return cc_write_string(out, ins->data.jump.target);
+    case CC_INSTR_BRANCH:
+        if (!cc_write_string(out, ins->data.branch.true_target))
+            return false;
+        if (!cc_write_string(out, ins->data.branch.false_target))
+            return false;
+        return true;
+    case CC_INSTR_CALL:
+    {
+        if (!cc_write_string(out, ins->data.call.symbol))
+            return false;
+        if (!cc_write_value_type(out, ins->data.call.return_type))
+            return false;
+        size_t arg_count = ins->data.call.arg_count;
+        if (!cc_write_size32(out, arg_count))
+            return false;
+        if (arg_count > 0 && !cc_write_value_type_array(out, ins->data.call.arg_types, arg_count))
+            return false;
+        if (!cc_write_bool(out, ins->data.call.is_tail_call))
+            return false;
+        return true;
+    }
+    case CC_INSTR_RET:
+        return cc_write_bool(out, ins->data.ret.has_value);
+    case CC_INSTR_COMMENT:
+        return cc_write_string(out, ins->data.comment.text);
+    default:
+        return false;
+    }
+}
+
+static bool cc_write_function(FILE *out, const CCFunction *fn)
+{
+    if (!cc_write_string(out, fn ? fn->name : NULL))
+        return false;
+    if (!cc_write_value_type(out, fn ? fn->return_type : CC_TYPE_VOID))
+        return false;
+    if (!cc_write_bool(out, fn && fn->is_varargs))
+        return false;
+    if (!cc_write_bool(out, fn && fn->is_noreturn))
+        return false;
+
+    size_t param_count = fn ? fn->param_count : 0;
+    if (!cc_write_size32(out, param_count))
+        return false;
+    if (param_count > 0 && !cc_write_value_type_array(out, fn->param_types, param_count))
+        return false;
+
+    size_t local_count = fn ? fn->local_count : 0;
+    if (!cc_write_size32(out, local_count))
+        return false;
+    if (local_count > 0 && !cc_write_value_type_array(out, fn->local_types, local_count))
+        return false;
+
+    size_t instr_count = fn ? fn->instruction_count : 0;
+    if (!cc_write_size32(out, instr_count))
+        return false;
+    for (size_t i = 0; i < instr_count; ++i)
+    {
+        if (!cc_write_instruction(out, &fn->instructions[i]))
+            return false;
+    }
+    return true;
+}
+
+bool cc_module_write_binary(const CCModule *module, const char *path, CCDiagnosticSink *sink)
+{
+    if (!module || !path)
+    {
+        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid arguments");
+        return false;
+    }
+
+    FILE *out = fopen(path, "wb");
+    if (!out)
+    {
+        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to open '%s': %s", path, strerror(errno));
+        return false;
+    }
+
+    bool ok = true;
+
+    static const char magic[] = {'C', 'C', 'B', 'I', 'N'};
+    if (fwrite(magic, 1, sizeof(magic), out) != sizeof(magic))
+        ok = false;
+    if (ok && !cc_write_u16(out, 1u))
+        ok = false;
+    if (ok && !cc_write_u32(out, module->version))
+        ok = false;
+
+    if (ok && !cc_write_size32(out, module->global_count))
+        ok = false;
+    for (size_t i = 0; ok && i < module->global_count; ++i)
+    {
+        if (!cc_write_global(out, &module->globals[i]))
+            ok = false;
+    }
+
+    if (ok && !cc_write_size32(out, module->extern_count))
+        ok = false;
+    for (size_t i = 0; ok && i < module->extern_count; ++i)
+    {
+        if (!cc_write_extern(out, &module->externs[i]))
+            ok = false;
+    }
+
+    if (ok && !cc_write_size32(out, module->function_count))
+        ok = false;
+    for (size_t i = 0; ok && i < module->function_count; ++i)
+    {
+        if (!cc_write_function(out, &module->functions[i]))
+            ok = false;
+    }
+
+    if (!ok)
+    {
+        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed while writing '%s'", path);
+        fclose(out);
+        remove(path);
+        return false;
+    }
+
+    if (fclose(out) != 0)
+    {
+        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to close '%s': %s", path, strerror(errno));
+        remove(path);
+        return false;
+    }
+
+    return true;
 }

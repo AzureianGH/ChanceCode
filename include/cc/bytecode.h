@@ -5,9 +5,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "diagnostics.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
 
 typedef enum {
     CC_TYPE_INVALID = -1,
@@ -270,6 +273,8 @@ bool cc_value_type_is_signed(CCValueType type);
 const char *cc_value_type_name(CCValueType type);
 
 void cc_module_optimize(CCModule *module, int opt_level);
+
+bool cc_module_write_binary(const CCModule *module, const char *path, CCDiagnosticSink *sink);
 
 #ifdef __cplusplus
 }
