@@ -1,11 +1,14 @@
 ccbytecode 2
 
 .extern printf params=(ptr) returns=i32 varargs
+.extern exit params=(i32) returns=void noreturn
 
-.func main ret=i32 params=0 locals=0
+.func main ret=i32 params=0 locals=1
+.locals i32
   const_str "Hello, world!\n"
   call printf i32 (ptr)
   drop i32
   const i32 0
   ret
+  comment End of main
 .endfunc

@@ -1,0 +1,13 @@
+ccbytecode 2
+
+.extern printf params=(ptr) returns=i32 varargs
+
+.global answer type=i32 init=123
+
+.func main ret=i32 params=0 locals=0
+  const_str "Hello, world!\n"
+  call printf i32 (ptr)
+  drop i32
+  load_global answer
+  ret
+.endfunc

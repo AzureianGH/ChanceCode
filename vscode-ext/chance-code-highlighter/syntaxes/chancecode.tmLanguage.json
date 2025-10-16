@@ -1,0 +1,127 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "ChanceCode Bytecode",
+  "scopeName": "source.chancecode",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#header" },
+    { "include": "#directives" },
+    { "include": "#instructions" },
+    { "include": "#types" },
+    { "include": "#attributes" },
+    { "include": "#numbers" },
+    { "include": "#flags" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.semicolon.chancecode",
+          "match": "^\\s*[;#].*$"
+        },
+        {
+          "name": "comment.line.double-slash.chancecode",
+          "match": "^\\s*//.*$"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.chancecode",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.chancecode" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.chancecode" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.chancecode",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "header": {
+      "patterns": [
+        {
+          "name": "meta.header.chancecode",
+          "match": "^\\s*(ccbytecode)\\s+(\\d+)\b",
+          "captures": {
+            "1": { "name": "keyword.control.header.chancecode" },
+            "2": { "name": "constant.numeric.version.chancecode" }
+          }
+        }
+      ]
+    },
+    "directives": {
+      "patterns": [
+        {
+          "name": "keyword.control.directive.chancecode",
+          "match": "^\\s*(\\.(?:extern|global|func|params|locals|endfunc|comment))\b"
+        }
+      ]
+    },
+    "instructions": {
+      "patterns": [
+        {
+          "name": "support.function.data.chancecode",
+          "match": "^\\s*(?:const_str|const|drop)\\b"
+        },
+        {
+          "name": "support.function.memory.chancecode",
+          "match": "^\\s*(?:load_param|addr_param|load_local|store_local|addr_local|load_global|store_global|addr_global|load_indirect|store_indirect|stack_alloc)\\b"
+        },
+        {
+          "name": "support.function.compute.chancecode",
+          "match": "^\\s*(?:binop|unop|compare|convert)\\b"
+        },
+        {
+          "name": "support.function.control.chancecode",
+          "match": "^\\s*(?:label|jump|branch|call|ret)\\b"
+        },
+        {
+          "name": "support.function.meta.chancecode",
+          "match": "^\\s*(?:comment)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.primitive.chancecode",
+          "match": "\\b(?:i1|i8|u8|i16|u16|i32|u32|i64|u64|f32|f64|ptr|void)\\b"
+        }
+      ]
+    },
+    "attributes": {
+      "patterns": [
+        {
+          "name": "entity.other.attribute-name.chancecode",
+          "match": "\\b(?:ret|params|locals|returns|type|align|init|const|bytes|size)=[^\\s]+"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.chancecode",
+          "match": "(?:0x[0-9A-Fa-f]+|(?<![\\w.])(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+))"
+        }
+      ]
+    },
+    "flags": {
+      "patterns": [
+        {
+          "name": "storage.modifier.flag.chancecode",
+          "match": "\\b(?:varargs|noreturn|unsigned)\\b"
+        }
+      ]
+    }
+  }
+}

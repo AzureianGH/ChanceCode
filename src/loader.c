@@ -99,7 +99,7 @@ static void resolve_pending_noreturn(LoaderState *st, const char *name)
         return;
     for (size_t i = 0; i < st->pending_noreturn_count; ++i)
     {
-        if (strcmp(st->pending_noreturn[i], name) == 0)
+        if (st->pending_noreturn[i] && strcmp(st->pending_noreturn[i], name) == 0)
         {
             mark_symbol_noreturn(st, name);
             free(st->pending_noreturn[i]);
@@ -322,6 +322,977 @@ static char *duplicate_token(const char *token)
         return NULL;
     memcpy(copy, token, len + 1);
     return copy;
+}
+
+static bool ccbin_read_exact(FILE *file, void *buffer, size_t size)
+{
+    if (size == 0)
+        return true;
+    return fread(buffer, 1, size, file) == size;
+}
+
+static bool ccbin_read_u8(FILE *file, uint8_t *value)
+{
+    unsigned char byte = 0;
+    if (!ccbin_read_exact(file, &byte, 1))
+        return false;
+    *value = (uint8_t)byte;
+    return true;
+}
+
+static bool ccbin_read_u16(FILE *file, uint16_t *value)
+{
+    unsigned char buf[2];
+    if (!ccbin_read_exact(file, buf, sizeof(buf)))
+        return false;
+    *value = (uint16_t)(buf[0] | ((uint16_t)buf[1] << 8));
+    return true;
+}
+
+static bool ccbin_read_u32(FILE *file, uint32_t *value)
+{
+    unsigned char buf[4];
+    if (!ccbin_read_exact(file, buf, sizeof(buf)))
+        return false;
+    *value = ((uint32_t)buf[0]) |
+             ((uint32_t)buf[1] << 8) |
+             ((uint32_t)buf[2] << 16) |
+             ((uint32_t)buf[3] << 24);
+    return true;
+}
+
+static bool ccbin_read_u64(FILE *file, uint64_t *value)
+{
+    unsigned char buf[8];
+    if (!ccbin_read_exact(file, buf, sizeof(buf)))
+        return false;
+    uint64_t result = 0;
+    for (int i = 0; i < 8; ++i)
+        result |= ((uint64_t)buf[i]) << (8 * i);
+    *value = result;
+    return true;
+}
+
+static bool ccbin_read_s32(FILE *file, int32_t *value)
+{
+    uint32_t tmp = 0;
+    if (!ccbin_read_u32(file, &tmp))
+        return false;
+    *value = (int32_t)tmp;
+    return true;
+}
+
+static bool ccbin_read_bool(FILE *file, bool *value)
+{
+    uint8_t byte = 0;
+    if (!ccbin_read_u8(file, &byte))
+        return false;
+    *value = (byte != 0);
+    return true;
+}
+
+static bool ccbin_read_size32(FILE *file, size_t *value)
+{
+    uint32_t tmp = 0;
+    if (!ccbin_read_u32(file, &tmp))
+        return false;
+    if (tmp > (uint32_t)SIZE_MAX)
+        return false;
+    *value = (size_t)tmp;
+    return true;
+}
+
+static bool ccbin_read_value_type(FILE *file, CCValueType *type)
+{
+    int32_t tmp = 0;
+    if (!ccbin_read_s32(file, &tmp))
+        return false;
+    if (tmp < CC_TYPE_INVALID || tmp > CC_TYPE_VOID)
+        return false;
+    *type = (CCValueType)tmp;
+    return true;
+}
+
+static bool ccbin_read_value_type_array(FILE *file, size_t count, CCValueType **out_types)
+{
+    if (count == 0)
+    {
+        *out_types = NULL;
+        return true;
+    }
+
+    CCValueType *types = (CCValueType *)malloc(sizeof(CCValueType) * count);
+    if (!types)
+        return false;
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (!ccbin_read_value_type(file, &types[i]))
+        {
+            free(types);
+            return false;
+        }
+    }
+
+    *out_types = types;
+    return true;
+}
+
+static bool ccbin_read_cstring(FILE *file, char **out, bool allow_empty)
+{
+    size_t len = 0;
+    if (!ccbin_read_size32(file, &len))
+        return false;
+
+    if (len == 0)
+    {
+        if (!allow_empty)
+            return false;
+        *out = NULL;
+        return true;
+    }
+
+    char *buf = (char *)malloc(len + 1);
+    if (!buf)
+        return false;
+    if (!ccbin_read_exact(file, buf, len))
+    {
+        free(buf);
+        return false;
+    }
+    buf[len] = '\0';
+    *out = buf;
+    return true;
+}
+
+static bool ccbin_read_bytes(FILE *file, size_t *length, uint8_t **data)
+{
+    if (!length || !data)
+        return false;
+    size_t len = 0;
+    if (!ccbin_read_size32(file, &len))
+        return false;
+    if (len == 0)
+    {
+        *length = 0;
+        *data = NULL;
+        return true;
+    }
+    uint8_t *buffer = (uint8_t *)malloc(len);
+    if (!buffer)
+        return false;
+    if (!ccbin_read_exact(file, buffer, len))
+    {
+        free(buffer);
+        return false;
+    }
+    *length = len;
+    *data = buffer;
+    return true;
+}
+
+static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDiagnosticSink *sink)
+{
+    const char *display_path = path ? path : "<input>";
+
+    uint16_t format_version = 0;
+    if (!ccbin_read_u16(file, &format_version))
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated header in %s", display_path);
+        return false;
+    }
+    if (format_version != 1u)
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: unsupported format version %u", (unsigned)format_version);
+        return false;
+    }
+
+    uint32_t module_version = 0;
+    if (!ccbin_read_u32(file, &module_version))
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: missing module version in %s", display_path);
+        return false;
+    }
+
+    cc_module_init(module, module_version);
+
+    size_t global_count = 0;
+    if (!ccbin_read_size32(file, &global_count))
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to read global count from %s", display_path);
+        goto fail;
+    }
+
+    for (size_t i = 0; i < global_count; ++i)
+    {
+        char *name = NULL;
+        if (!ccbin_read_cstring(file, &name, false))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid global name at index %zu in %s", i, display_path);
+            goto fail;
+        }
+
+        CCGlobal *global = cc_module_add_global(module, name);
+        if (!global)
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to allocate global '%s'", name ? name : "<null>");
+            free(name);
+            goto fail;
+        }
+        free(name);
+
+        CCValueType type = CC_TYPE_INVALID;
+        if (!ccbin_read_value_type(file, &type))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid global type at index %zu", i);
+            goto fail;
+        }
+        global->type = type;
+
+        bool is_const = false;
+        if (!ccbin_read_bool(file, &is_const))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated global const flag at index %zu", i);
+            goto fail;
+        }
+        global->is_const = is_const;
+
+        size_t alignment = 0;
+        if (!ccbin_read_size32(file, &alignment))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated global alignment at index %zu", i);
+            goto fail;
+        }
+        global->alignment = alignment;
+
+        uint8_t kind_u8 = 0;
+        if (!ccbin_read_u8(file, &kind_u8) || kind_u8 > (uint8_t)CC_GLOBAL_INIT_BYTES)
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid global initializer kind at index %zu", i);
+            goto fail;
+        }
+        global->init.kind = (CCGlobalInitKind)kind_u8;
+
+        switch (global->init.kind)
+        {
+        case CC_GLOBAL_INIT_NONE:
+            break;
+        case CC_GLOBAL_INIT_INT:
+        {
+            uint64_t value = 0;
+            if (!ccbin_read_u64(file, &value))
+            {
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated integer initializer for global index %zu", i);
+                goto fail;
+            }
+            global->init.payload.u64 = value;
+            break;
+        }
+        case CC_GLOBAL_INIT_FLOAT:
+        {
+            uint64_t bits = 0;
+            if (!ccbin_read_u64(file, &bits))
+            {
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated float initializer for global index %zu", i);
+                goto fail;
+            }
+            double value = 0.0;
+            memcpy(&value, &bits, sizeof(value));
+            global->init.payload.f64 = value;
+            break;
+        }
+        case CC_GLOBAL_INIT_STRING:
+        {
+            size_t len = 0;
+            uint8_t *raw = NULL;
+            if (!ccbin_read_bytes(file, &len, &raw))
+            {
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated string initializer for global index %zu", i);
+                goto fail;
+            }
+            global->init.payload.string.length = len;
+            global->init.payload.string.data = (char *)raw;
+            break;
+        }
+        case CC_GLOBAL_INIT_BYTES:
+        {
+            size_t len = 0;
+            uint8_t *raw = NULL;
+            if (!ccbin_read_bytes(file, &len, &raw))
+            {
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated bytes initializer for global index %zu", i);
+                goto fail;
+            }
+            global->init.payload.bytes.size = len;
+            global->init.payload.bytes.data = raw;
+            break;
+        }
+        default:
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: unknown global initializer kind at index %zu", i);
+            goto fail;
+        }
+
+        if (global->alignment == 0)
+            global->alignment = cc_value_type_size(global->type);
+    }
+
+    size_t extern_count = 0;
+    if (!ccbin_read_size32(file, &extern_count))
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to read extern count from %s", display_path);
+        goto fail;
+    }
+
+    for (size_t i = 0; i < extern_count; ++i)
+    {
+        char *name = NULL;
+        if (!ccbin_read_cstring(file, &name, false))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid extern name at index %zu", i);
+            goto fail;
+        }
+
+        CCExtern *ext = cc_module_add_extern(module, name);
+        if (!ext)
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to allocate extern '%s'", name ? name : "<null>");
+            free(name);
+            goto fail;
+        }
+        free(name);
+
+        CCValueType ret_type = CC_TYPE_VOID;
+        if (!ccbin_read_value_type(file, &ret_type))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid return type for extern index %zu", i);
+            goto fail;
+        }
+        ext->return_type = ret_type;
+
+        bool flag = false;
+        if (!ccbin_read_bool(file, &flag))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated varargs flag for extern index %zu", i);
+            goto fail;
+        }
+        ext->is_varargs = flag;
+
+        if (!ccbin_read_bool(file, &flag))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated noreturn flag for extern index %zu", i);
+            goto fail;
+        }
+        ext->is_noreturn = flag;
+
+        size_t param_count = 0;
+        if (!ccbin_read_size32(file, &param_count))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated param count for extern index %zu", i);
+            goto fail;
+        }
+
+        CCValueType *param_types = NULL;
+        if (!ccbin_read_value_type_array(file, param_count, &param_types))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid parameter types for extern index %zu", i);
+            goto fail;
+        }
+
+        free(ext->param_types);
+        ext->param_types = param_types;
+        ext->param_count = param_count;
+    }
+
+    size_t function_count = 0;
+    if (!ccbin_read_size32(file, &function_count))
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to read function count from %s", display_path);
+        goto fail;
+    }
+
+    for (size_t i = 0; i < function_count; ++i)
+    {
+        char *name = NULL;
+        if (!ccbin_read_cstring(file, &name, false))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid function name at index %zu", i);
+            goto fail;
+        }
+
+        CCFunction *fn = cc_module_add_function(module, name);
+        if (!fn)
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to allocate function '%s'", name ? name : "<null>");
+            free(name);
+            goto fail;
+        }
+        free(name);
+
+        CCValueType ret_type = CC_TYPE_VOID;
+        if (!ccbin_read_value_type(file, &ret_type))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid return type for function index %zu", i);
+            goto fail;
+        }
+        fn->return_type = ret_type;
+
+        bool flag = false;
+        if (!ccbin_read_bool(file, &flag))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated varargs flag for function index %zu", i);
+            goto fail;
+        }
+        fn->is_varargs = flag;
+
+        if (!ccbin_read_bool(file, &flag))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated noreturn flag for function index %zu", i);
+            goto fail;
+        }
+        fn->is_noreturn = flag;
+
+        size_t param_count = 0;
+        if (!ccbin_read_size32(file, &param_count))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated parameter count for function index %zu", i);
+            goto fail;
+        }
+
+        CCValueType *param_types = NULL;
+        if (!ccbin_read_value_type_array(file, param_count, &param_types))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid parameter types for function index %zu", i);
+            goto fail;
+        }
+        if (!cc_function_set_param_types(fn, param_types, param_count))
+        {
+            free(param_types);
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to assign parameter types for function index %zu", i);
+            goto fail;
+        }
+        free(param_types);
+
+        size_t local_count = 0;
+        if (!ccbin_read_size32(file, &local_count))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated locals count for function index %zu", i);
+            goto fail;
+        }
+
+        CCValueType *local_types = NULL;
+        if (!ccbin_read_value_type_array(file, local_count, &local_types))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid local types for function index %zu", i);
+            goto fail;
+        }
+        if (!cc_function_set_local_types(fn, local_types, local_count))
+        {
+            free(local_types);
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to assign local types for function index %zu", i);
+            goto fail;
+        }
+        free(local_types);
+
+        size_t instr_count = 0;
+        if (!ccbin_read_size32(file, &instr_count))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated instruction count for function index %zu", i);
+            goto fail;
+        }
+
+        for (size_t ins_index = 0; ins_index < instr_count; ++ins_index)
+        {
+            uint8_t kind_byte = 0;
+            if (!ccbin_read_u8(file, &kind_byte) || kind_byte > (uint8_t)CC_INSTR_COMMENT)
+            {
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid instruction kind in function index %zu", i);
+                goto fail;
+            }
+            CCInstrKind kind = (CCInstrKind)kind_byte;
+
+            uint32_t line = 0;
+            if (!ccbin_read_u32(file, &line))
+            {
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated instruction line in function index %zu", i);
+                goto fail;
+            }
+
+            CCInstruction *ins = cc_function_append_instruction(fn, kind, (size_t)line);
+            if (!ins)
+            {
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: failed to append instruction %zu in function index %zu", ins_index, i);
+                goto fail;
+            }
+
+            switch (kind)
+            {
+            case CC_INSTR_CONST:
+            {
+                CCValueType type = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &type))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid const type in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.constant.type = type;
+
+                bool is_unsigned = false;
+                if (!ccbin_read_bool(file, &is_unsigned))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated const unsigned flag in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.constant.is_unsigned = is_unsigned;
+
+                bool is_null = false;
+                if (!ccbin_read_bool(file, &is_null))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated const null flag in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.constant.is_null = is_null;
+
+                if (type == CC_TYPE_F32)
+                {
+                    uint32_t bits = 0;
+                    if (!ccbin_read_u32(file, &bits))
+                    {
+                        if (sink)
+                            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated f32 const in function index %zu", i);
+                        goto fail;
+                    }
+                    float value = 0.0f;
+                    memcpy(&value, &bits, sizeof(value));
+                    ins->data.constant.value.f32 = value;
+                }
+                else if (type == CC_TYPE_F64)
+                {
+                    uint64_t bits = 0;
+                    if (!ccbin_read_u64(file, &bits))
+                    {
+                        if (sink)
+                            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated f64 const in function index %zu", i);
+                        goto fail;
+                    }
+                    double value = 0.0;
+                    memcpy(&value, &bits, sizeof(value));
+                    ins->data.constant.value.f64 = value;
+                }
+                else
+                {
+                    uint64_t raw = 0;
+                    if (!ccbin_read_u64(file, &raw))
+                    {
+                        if (sink)
+                            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated integer const in function index %zu", i);
+                        goto fail;
+                    }
+                    if (type == CC_TYPE_PTR || is_unsigned)
+                        ins->data.constant.value.u64 = raw;
+                    else
+                        ins->data.constant.value.i64 = (int64_t)raw;
+                }
+                break;
+            }
+            case CC_INSTR_CONST_STRING:
+            {
+                size_t len = 0;
+                uint8_t *raw = NULL;
+                if (!ccbin_read_bytes(file, &len, &raw))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated const_string payload in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.const_string.length = len;
+                ins->data.const_string.bytes = (char *)raw;
+
+                char *hint = NULL;
+                if (!ccbin_read_cstring(file, &hint, true))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid const_string hint in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.const_string.label_hint = hint;
+                break;
+            }
+            case CC_INSTR_LOAD_PARAM:
+            case CC_INSTR_ADDR_PARAM:
+            {
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid load_param type in function index %zu", i);
+                    goto fail;
+                }
+                uint32_t index = 0;
+                if (!ccbin_read_u32(file, &index))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated load_param index in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.param.type = ty;
+                ins->data.param.index = index;
+                break;
+            }
+            case CC_INSTR_LOAD_LOCAL:
+            case CC_INSTR_STORE_LOCAL:
+            case CC_INSTR_ADDR_LOCAL:
+            {
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid local type in function index %zu", i);
+                    goto fail;
+                }
+                uint32_t index = 0;
+                if (!ccbin_read_u32(file, &index))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated local index in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.local.type = ty;
+                ins->data.local.index = index;
+                break;
+            }
+            case CC_INSTR_LOAD_GLOBAL:
+            case CC_INSTR_STORE_GLOBAL:
+            case CC_INSTR_ADDR_GLOBAL:
+            {
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid global instruction type in function index %zu", i);
+                    goto fail;
+                }
+                char *symbol = NULL;
+                if (!ccbin_read_cstring(file, &symbol, false))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid global symbol in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.global.type = ty;
+                ins->data.global.symbol = symbol;
+                break;
+            }
+            case CC_INSTR_LOAD_INDIRECT:
+            case CC_INSTR_STORE_INDIRECT:
+            {
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid indirect type in function index %zu", i);
+                    goto fail;
+                }
+                bool is_unsigned = false;
+                if (!ccbin_read_bool(file, &is_unsigned))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated indirect flag in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.memory.type = ty;
+                ins->data.memory.is_unsigned = is_unsigned;
+                break;
+            }
+            case CC_INSTR_BINOP:
+            {
+                uint8_t op = 0;
+                if (!ccbin_read_u8(file, &op) || op > (uint8_t)CC_BINOP_SHR)
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid binop opcode in function index %zu", i);
+                    goto fail;
+                }
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid binop type in function index %zu", i);
+                    goto fail;
+                }
+                bool is_unsigned = false;
+                if (!ccbin_read_bool(file, &is_unsigned))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated binop flag in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.binop.op = (CCBinaryOp)op;
+                ins->data.binop.type = ty;
+                ins->data.binop.is_unsigned = is_unsigned;
+                break;
+            }
+            case CC_INSTR_UNOP:
+            {
+                uint8_t op = 0;
+                if (!ccbin_read_u8(file, &op) || op > (uint8_t)CC_UNOP_BITNOT)
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid unop opcode in function index %zu", i);
+                    goto fail;
+                }
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid unop type in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.unop.op = (CCUnaryOp)op;
+                ins->data.unop.type = ty;
+                break;
+            }
+            case CC_INSTR_COMPARE:
+            {
+                uint8_t op = 0;
+                if (!ccbin_read_u8(file, &op) || op > (uint8_t)CC_COMPARE_GE)
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid compare opcode in function index %zu", i);
+                    goto fail;
+                }
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid compare type in function index %zu", i);
+                    goto fail;
+                }
+                bool is_unsigned = false;
+                if (!ccbin_read_bool(file, &is_unsigned))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated compare flag in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.compare.op = (CCCompareOp)op;
+                ins->data.compare.type = ty;
+                ins->data.compare.is_unsigned = is_unsigned;
+                break;
+            }
+            case CC_INSTR_CONVERT:
+            {
+                uint8_t op = 0;
+                if (!ccbin_read_u8(file, &op) || op > (uint8_t)CC_CONVERT_BITCAST)
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid convert opcode in function index %zu", i);
+                    goto fail;
+                }
+                CCValueType from = CC_TYPE_INVALID;
+                CCValueType to = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &from) || !ccbin_read_value_type(file, &to))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid convert types in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.convert.kind = (CCConvertKind)op;
+                ins->data.convert.from_type = from;
+                ins->data.convert.to_type = to;
+                break;
+            }
+            case CC_INSTR_STACK_ALLOC:
+            {
+                uint32_t size_bytes = 0;
+                uint32_t alignment = 0;
+                if (!ccbin_read_u32(file, &size_bytes) || !ccbin_read_u32(file, &alignment))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated stack_alloc operands in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.stack_alloc.size_bytes = size_bytes;
+                ins->data.stack_alloc.alignment = alignment;
+                break;
+            }
+            case CC_INSTR_DROP:
+            {
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid drop type in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.drop.type = ty;
+                break;
+            }
+            case CC_INSTR_LABEL:
+            {
+                char *name_tok = NULL;
+                if (!ccbin_read_cstring(file, &name_tok, false))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid label name in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.label.name = name_tok;
+                break;
+            }
+            case CC_INSTR_JUMP:
+            {
+                char *target = NULL;
+                if (!ccbin_read_cstring(file, &target, false))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid jump target in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.jump.target = target;
+                break;
+            }
+            case CC_INSTR_BRANCH:
+            {
+                char *true_target = NULL;
+                char *false_target = NULL;
+                if (!ccbin_read_cstring(file, &true_target, false) || !ccbin_read_cstring(file, &false_target, false))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid branch targets in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.branch.true_target = true_target;
+                ins->data.branch.false_target = false_target;
+                break;
+            }
+            case CC_INSTR_CALL:
+            {
+                char *symbol = NULL;
+                if (!ccbin_read_cstring(file, &symbol, false))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid call symbol in function index %zu", i);
+                    goto fail;
+                }
+                CCValueType ret_ty = CC_TYPE_VOID;
+                if (!ccbin_read_value_type(file, &ret_ty))
+                {
+                    free(symbol);
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid call return type in function index %zu", i);
+                    goto fail;
+                }
+                size_t arg_count = 0;
+                if (!ccbin_read_size32(file, &arg_count))
+                {
+                    free(symbol);
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated call arg count in function index %zu", i);
+                    goto fail;
+                }
+                CCValueType *arg_types = NULL;
+                if (!ccbin_read_value_type_array(file, arg_count, &arg_types))
+                {
+                    free(symbol);
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid call arg types in function index %zu", i);
+                    goto fail;
+                }
+                bool is_tail = false;
+                if (!ccbin_read_bool(file, &is_tail))
+                {
+                    free(symbol);
+                    free(arg_types);
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated call tail flag in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.call.symbol = symbol;
+                ins->data.call.return_type = ret_ty;
+                ins->data.call.arg_types = arg_types;
+                ins->data.call.arg_count = arg_count;
+                ins->data.call.is_tail_call = is_tail;
+                break;
+            }
+            case CC_INSTR_RET:
+            {
+                bool has_value = false;
+                if (!ccbin_read_bool(file, &has_value))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated ret flag in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.ret.has_value = has_value;
+                break;
+            }
+            case CC_INSTR_COMMENT:
+            {
+                char *text = NULL;
+                if (!ccbin_read_cstring(file, &text, true))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid comment text in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.comment.text = text;
+                break;
+            }
+            default:
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: unsupported instruction kind %u", (unsigned)kind);
+                goto fail;
+            }
+        }
+    }
+
+    return true;
+
+fail:
+    cc_module_free(module);
+    return false;
 }
 
 static bool parse_string_literal(const char *input, char **out_data, size_t *out_len, const char **out_end)
@@ -1434,8 +2405,25 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
         return false;
     }
 
+    unsigned char magic[5];
+    size_t magic_read = fread(magic, 1, sizeof(magic), file);
+    if (magic_read == sizeof(magic) && memcmp(magic, "CCBIN", sizeof(magic)) == 0)
+    {
+        bool ok = cc_load_binary(file, path, module, sink);
+        fclose(file);
+        return ok;
+    }
+
+    if (fseek(file, 0, SEEK_SET) != 0)
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "failed to rewind %s", path);
+        fclose(file);
+        return false;
+    }
+
     bool success = true;
-    LoaderState st;
+    LoaderState st = { 0 };
     st.path = path;
     st.module = module;
     st.sink = sink;
@@ -1743,6 +2731,8 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
     }
 
     fclose(file);
+
+    pending_noreturn_destroy(&st);
 
     if (!success)
         cc_module_free(module);
