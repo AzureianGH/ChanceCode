@@ -4,6 +4,8 @@
   "description": "Syntax highlighting and language features for ChanceCode bytecode files.",
   "version": "0.0.1",
   "repository": "https://github.com/AzureianGH/ChanceCode",
+  "publisher": "NathanHornby",
+  "icon": "icon.png",
   "engines": {
     "vscode": "^1.105.0"
   },
