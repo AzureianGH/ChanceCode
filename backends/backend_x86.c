@@ -51,6 +51,8 @@ typedef struct
     const char *reg16[6];
     const char *reg32[6];
     const char *reg64[6];
+    size_t float_register_count;
+    const char *xmm[8];
 } X86ABIInfo;
 
 static const X86Syntax kNasmSyntax = {
@@ -111,6 +113,8 @@ static const X86ABIInfo kX86AbiWin64 = {
     .reg16 = {"cx", "dx", "r8w", "r9w", NULL, NULL},
     .reg32 = {"ecx", "edx", "r8d", "r9d", NULL, NULL},
     .reg64 = {"rcx", "rdx", "r8", "r9", NULL, NULL},
+    .float_register_count = 4,
+    .xmm = {"xmm0", "xmm1", "xmm2", "xmm3", NULL, NULL, NULL, NULL},
 };
 
 static const X86ABIInfo kX86AbiSystemV = {
@@ -121,6 +125,8 @@ static const X86ABIInfo kX86AbiSystemV = {
     .reg16 = {"di", "si", "dx", "cx", "r8w", "r9w"},
     .reg32 = {"edi", "esi", "edx", "ecx", "r8d", "r9d"},
     .reg64 = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"},
+    .float_register_count = 8,
+    .xmm = {"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"},
 };
 
 typedef enum
@@ -801,15 +807,94 @@ static bool emit_push_rax(FILE *out, X86FunctionContext *ctx, CCValueType type, 
     return true;
 }
 
+static bool emit_pop_float_operand(X86FunctionContext *ctx, const char *xmm_reg, CCValueType type, size_t line)
+{
+    if (!ctx || !xmm_reg)
+        return false;
+
+    StackValue value;
+    if (!function_stack_pop(ctx, &value))
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, line, "floating-point operand missing");
+        return false;
+    }
+
+    switch (value.location)
+    {
+    case STACK_LOC_STACK:
+        fprintf(ctx->out, "    pop rax\n");
+        break;
+    case STACK_LOC_RAX:
+        break;
+    case STACK_LOC_R10:
+        fprintf(ctx->out, "    mov rax, r10\n");
+        ctx->reg_r10_in_use = false;
+        break;
+    case STACK_LOC_R11:
+        fprintf(ctx->out, "    mov rax, r11\n");
+        ctx->reg_r11_in_use = false;
+        break;
+    case STACK_LOC_NONE:
+    default:
+        emit_diag(ctx->sink, CC_DIAG_ERROR, line, "floating-point operand unavailable");
+        return false;
+    }
+
+    if (type == CC_TYPE_F32)
+        fprintf(ctx->out, "    movd %s, eax\n", xmm_reg);
+    else if (type == CC_TYPE_F64)
+        fprintf(ctx->out, "    movq %s, rax\n", xmm_reg);
+    else
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, line, "unexpected non-float type in floating-point operand");
+        return false;
+    }
+
+    return true;
+}
+
+static bool emit_push_float_from_xmm(X86FunctionContext *ctx, const char *xmm_reg, CCValueType type)
+{
+    if (!ctx || !xmm_reg)
+        return false;
+
+    if (type == CC_TYPE_F32)
+        fprintf(ctx->out, "    movd eax, %s\n", xmm_reg);
+    else if (type == CC_TYPE_F64)
+        fprintf(ctx->out, "    movq rax, %s\n", xmm_reg);
+    else
+        return false;
+
+    return emit_push_rax(ctx->out, ctx, type, false);
+}
+
 static bool emit_load_const(X86FunctionContext *ctx, const CCInstruction *ins)
 {
     const CCValueType type = ins->data.constant.type;
     bool is_unsigned = ins->data.constant.is_unsigned;
     x86_ensure_rax_available(ctx);
-    if (type == CC_TYPE_F32 || type == CC_TYPE_F64)
+
+    if (type == CC_TYPE_F32)
     {
-        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "x86 backend: floating constants not supported yet");
-        return false;
+        union
+        {
+            float f;
+            uint32_t u;
+        } bits;
+        bits.f = ins->data.constant.value.f32;
+        fprintf(ctx->out, "    mov eax, 0x%08x\n", bits.u);
+        return emit_push_rax(ctx->out, ctx, type, false);
+    }
+    if (type == CC_TYPE_F64)
+    {
+        union
+        {
+            double d;
+            uint64_t u;
+        } bits;
+        bits.d = ins->data.constant.value.f64;
+        fprintf(ctx->out, "    mov rax, 0x%016llx\n", (unsigned long long)bits.u);
+        return emit_push_rax(ctx->out, ctx, type, false);
     }
 
     if (type == CC_TYPE_PTR && ins->data.constant.is_null)
@@ -1102,6 +1187,36 @@ static bool emit_store_indirect(X86FunctionContext *ctx, const CCInstruction *in
 
 static bool emit_binary_op(X86FunctionContext *ctx, const CCInstruction *ins)
 {
+    if (cc_value_type_is_float(ins->data.binop.type))
+    {
+        CCValueType type = ins->data.binop.type;
+        if (!emit_pop_float_operand(ctx, "xmm1", type, ins->line))
+            return false;
+        if (!emit_pop_float_operand(ctx, "xmm0", type, ins->line))
+            return false;
+
+        switch (ins->data.binop.op)
+        {
+        case CC_BINOP_ADD:
+            fprintf(ctx->out, type == CC_TYPE_F32 ? "    addss xmm0, xmm1\n" : "    addsd xmm0, xmm1\n");
+            break;
+        case CC_BINOP_SUB:
+            fprintf(ctx->out, type == CC_TYPE_F32 ? "    subss xmm0, xmm1\n" : "    subsd xmm0, xmm1\n");
+            break;
+        case CC_BINOP_MUL:
+            fprintf(ctx->out, type == CC_TYPE_F32 ? "    mulss xmm0, xmm1\n" : "    mulsd xmm0, xmm1\n");
+            break;
+        case CC_BINOP_DIV:
+            fprintf(ctx->out, type == CC_TYPE_F32 ? "    divss xmm0, xmm1\n" : "    divsd xmm0, xmm1\n");
+            break;
+        default:
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "unsupported floating-point binop %d", ins->data.binop.op);
+            return false;
+        }
+
+        return emit_push_float_from_xmm(ctx, "xmm0", type);
+    }
+
     StackValue rhs;
     StackValue lhs;
     if (!emit_pop_to(ctx->out, ctx, "rbx", &rhs) || !emit_pop_to_rax(ctx->out, ctx, &lhs))
@@ -1201,6 +1316,57 @@ static bool emit_unary_op(X86FunctionContext *ctx, const CCInstruction *ins)
 
 static bool emit_compare(X86FunctionContext *ctx, const CCInstruction *ins)
 {
+    if (cc_value_type_is_float(ins->data.compare.type))
+    {
+        CCValueType type = ins->data.compare.type;
+        if (!emit_pop_float_operand(ctx, "xmm1", type, ins->line))
+            return false;
+        if (!emit_pop_float_operand(ctx, "xmm0", type, ins->line))
+            return false;
+
+        uint8_t predicate = 0xFF;
+        switch (ins->data.compare.op)
+        {
+        case CC_COMPARE_EQ:
+            predicate = 0;
+            break;
+        case CC_COMPARE_NE:
+            predicate = 4;
+            break;
+        case CC_COMPARE_LT:
+            predicate = 1;
+            break;
+        case CC_COMPARE_LE:
+            predicate = 2;
+            break;
+        case CC_COMPARE_GT:
+            predicate = 6;
+            break;
+        case CC_COMPARE_GE:
+            predicate = 5;
+            break;
+        default:
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "unsupported floating-point compare op %d", ins->data.compare.op);
+            return false;
+        }
+
+        if (predicate == 0xFF)
+            return false;
+
+        if (type == CC_TYPE_F32)
+            fprintf(ctx->out, "    cmpss xmm0, xmm1, %u\n", predicate);
+        else
+            fprintf(ctx->out, "    cmpsd xmm0, xmm1, %u\n", predicate);
+
+        if (type == CC_TYPE_F32)
+            fprintf(ctx->out, "    movd eax, xmm0\n");
+        else
+            fprintf(ctx->out, "    movq rax, xmm0\n");
+
+        fprintf(ctx->out, "    and eax, 1\n");
+        return emit_push_rax(ctx->out, ctx, CC_TYPE_I1, true);
+    }
+
     StackValue rhs;
     StackValue lhs;
     if (!emit_pop_to(ctx->out, ctx, "rbx", &rhs) || !emit_pop_to_rax(ctx->out, ctx, &lhs))
@@ -1239,21 +1405,107 @@ static bool emit_convert(X86FunctionContext *ctx, const CCInstruction *ins)
 
     CCValueType from = ins->data.convert.from_type;
     CCValueType to = ins->data.convert.to_type;
+    bool from_is_float = cc_value_type_is_float(from);
+    bool to_is_float = cc_value_type_is_float(to);
+    bool from_is_int = cc_value_type_is_integer(from) || from == CC_TYPE_PTR;
+    bool to_is_int = cc_value_type_is_integer(to) || to == CC_TYPE_PTR;
 
     switch (ins->data.convert.kind)
     {
     case CC_CONVERT_TRUNC:
+        if (!from_is_int || !to_is_int)
+        {
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "truncate conversion requires integer types");
+            return false;
+        }
         emit_truncate_rax(ctx->out, to, !cc_value_type_is_signed(to));
         break;
     case CC_CONVERT_SEXT:
+        if (!from_is_int || !to_is_int)
+        {
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "sign-extend conversion requires integer types");
+            return false;
+        }
         emit_sign_extend(ctx->out, from);
         emit_sign_extend(ctx->out, to);
         break;
     case CC_CONVERT_ZEXT:
+        if (!from_is_int || !to_is_int)
+        {
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "zero-extend conversion requires integer types");
+            return false;
+        }
         emit_zero_extend(ctx->out, from);
         emit_zero_extend(ctx->out, to);
         break;
+    case CC_CONVERT_F2I:
+        if (!from_is_float || !to_is_int)
+        {
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "unsupported f2i conversion");
+            return false;
+        }
+        if (from == CC_TYPE_F32)
+            fprintf(ctx->out, "    movd xmm0, eax\n");
+        else
+            fprintf(ctx->out, "    movq xmm0, rax\n");
+
+        size_t to_size = cc_value_type_size(to);
+        if (from == CC_TYPE_F32)
+        {
+            if (to_size > 4)
+                fprintf(ctx->out, "    cvttss2si rax, xmm0\n");
+            else
+                fprintf(ctx->out, "    cvttss2si eax, xmm0\n");
+        }
+        else
+        {
+            if (to_size > 4)
+                fprintf(ctx->out, "    cvttsd2si rax, xmm0\n");
+            else
+                fprintf(ctx->out, "    cvttsd2si eax, xmm0\n");
+        }
+
+        if (to_size < 8)
+            emit_truncate_rax(ctx->out, to, !cc_value_type_is_signed(to));
+        return emit_push_rax(ctx->out, ctx, to, !cc_value_type_is_signed(to));
+    case CC_CONVERT_I2F:
+        if (!from_is_int || !to_is_float)
+        {
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "unsupported i2f conversion");
+            return false;
+        }
+        if (cc_value_type_is_signed(from))
+            emit_sign_extend(ctx->out, from);
+        else
+            emit_zero_extend(ctx->out, from);
+
+        if (to == CC_TYPE_F32)
+            fprintf(ctx->out, "    cvtsi2ss xmm0, rax\n");
+        else
+            fprintf(ctx->out, "    cvtsi2sd xmm0, rax\n");
+
+        return emit_push_float_from_xmm(ctx, "xmm0", to);
     case CC_CONVERT_BITCAST:
+        if (from_is_float && to_is_float && from != to)
+        {
+            if (from == CC_TYPE_F32)
+                fprintf(ctx->out, "    movd xmm0, eax\n");
+            else
+                fprintf(ctx->out, "    movq xmm0, rax\n");
+
+            if (from == CC_TYPE_F32 && to == CC_TYPE_F64)
+                fprintf(ctx->out, "    cvtss2sd xmm0, xmm0\n");
+            else if (from == CC_TYPE_F64 && to == CC_TYPE_F32)
+                fprintf(ctx->out, "    cvtsd2ss xmm0, xmm0\n");
+            else
+            {
+                emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "unsupported floating bitcast conversion");
+                return false;
+            }
+
+            return emit_push_float_from_xmm(ctx, "xmm0", to);
+        }
+        /* fall through: other bitcasts are no-ops */
         break;
     default:
         emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "unsupported convert kind %d", ins->data.convert.kind);
@@ -1323,8 +1575,18 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     {
         size_t offset = call_frame_size + (arg_count - 1 - i) * 8;
         CCValueType arg_type = ins->data.call.arg_types ? ins->data.call.arg_types[i] : CC_TYPE_I64;
-        bool is_unsigned = !cc_value_type_is_signed(arg_type) && args[i].is_unsigned;
-        switch (arg_type)
+        bool promote_f32 = is_varargs && arg_type == CC_TYPE_F32;
+        CCValueType pass_type = promote_f32 ? CC_TYPE_F64 : arg_type;
+        bool is_unsigned = !cc_value_type_is_signed(pass_type) && args[i].is_unsigned;
+
+        if (promote_f32)
+        {
+            fprintf(ctx->out, "    movss xmm7, %s [rsp + %zu]\n", ctx->syntax->dword_mem_keyword, offset);
+            fprintf(ctx->out, "    cvtss2sd xmm7, xmm7\n");
+            fprintf(ctx->out, "    movsd %s [rsp + %zu], xmm7\n", ctx->syntax->qword_mem_keyword, offset);
+        }
+
+        switch (pass_type)
         {
         case CC_TYPE_I1:
         case CC_TYPE_U8:
