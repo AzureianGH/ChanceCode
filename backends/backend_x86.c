@@ -519,8 +519,44 @@ static void x86_move_top_from_rax(X86FunctionContext *ctx)
     }
     else
     {
-        fprintf(ctx->out, "    push rax\n");
-        top->location = STACK_LOC_STACK;
+        /* Spill the oldest register-backed value so argument order is preserved. */
+        size_t spill_index = SIZE_MAX;
+        StackLocation spill_loc = STACK_LOC_NONE;
+
+        for (size_t i = 0; i < ctx->stack_size; ++i)
+        {
+            StackLocation loc = ctx->stack[i].location;
+            if (loc == STACK_LOC_R10 || loc == STACK_LOC_R11)
+            {
+                spill_index = i;
+                spill_loc = loc;
+                break;
+            }
+        }
+
+        if (spill_loc == STACK_LOC_R10)
+        {
+            fprintf(ctx->out, "    push r10\n");
+            ctx->reg_r10_in_use = false;
+            ctx->stack[spill_index].location = STACK_LOC_STACK;
+            fprintf(ctx->out, "    mov r10, rax\n");
+            top->location = STACK_LOC_R10;
+            ctx->reg_r10_in_use = true;
+        }
+        else if (spill_loc == STACK_LOC_R11)
+        {
+            fprintf(ctx->out, "    push r11\n");
+            ctx->reg_r11_in_use = false;
+            ctx->stack[spill_index].location = STACK_LOC_STACK;
+            fprintf(ctx->out, "    mov r11, rax\n");
+            top->location = STACK_LOC_R11;
+            ctx->reg_r11_in_use = true;
+        }
+        else
+        {
+            fprintf(ctx->out, "    push rax\n");
+            top->location = STACK_LOC_STACK;
+        }
     }
 }
 
