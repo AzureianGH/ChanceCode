@@ -1604,6 +1604,7 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     size_t call_frame_size = base_call_area + align_padding;
     bool is_noreturn = module_symbol_is_noreturn(ctx->module->module, ins->data.call.symbol);
     bool is_varargs = module_symbol_is_varargs(ctx->module->module, ins->data.call.symbol);
+    bool needs_shadow_spills = is_varargs && ctx->abi == &kX86AbiWin64;
     if (call_frame_size > 0)
         fprintf(ctx->out, "    sub rsp, %zu\n", call_frame_size);
 
@@ -1653,11 +1654,18 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
 
         if (i < reg_count)
         {
-            fprintf(ctx->out, "    mov %s, rax\n", abi->reg64[i]);
+            const char *reg64 = abi->reg64[i];
+            fprintf(ctx->out, "    mov %s, rax\n", reg64);
+            if (needs_shadow_spills)
+            {
+                size_t shadow_offset = i * 8;
+                // Windows varargs expect register arguments mirrored in the shadow space.
+                fprintf(ctx->out, "    mov %s [rsp + %zu], %s\n", ctx->syntax->qword_mem_keyword, shadow_offset, reg64);
+            }
         }
         else
         {
-            size_t slot = align_padding + abi->shadow_space_bytes + (i - reg_count) * 8;
+            size_t slot = abi->shadow_space_bytes + (i - reg_count) * 8;
             fprintf(ctx->out, "    mov %s [rsp + %zu], rax\n", ctx->syntax->qword_mem_keyword, slot);
         }
     }
