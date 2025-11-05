@@ -66,7 +66,7 @@ Backends may expose additional keys via `--option`; the CLI simply forwards them
 - `CHANCECODEC_CMD` or `CHANCECODEC` environment variables.
 - `CHANCECODE_HOME` pointing at a directory that contains `chancecodec` or `build/.../chancecodec`.
 
-When rolling your own tools, link against `chance_core` (from [`CEnhanced`](../CEnhanced)) or use the headers here directly to load modules and invoke backends.
+When rolling your own tools, link against `chance_core` (from [`CEnhanced`](https://github.com/AzureianGH/CEnhanced)) or use the headers here directly to load modules and invoke backends.
 
 ## Writing a New Backend
 1. Define a `CCBackend` struct with a unique `name`, `description`, and `emit` callback.
