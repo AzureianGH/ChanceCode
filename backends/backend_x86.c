@@ -618,6 +618,36 @@ static bool ensure_param_offsets(X86FunctionContext *ctx)
     return true;
 }
 
+static bool x86_vararg_base_offset(const X86FunctionContext *ctx, size_t *out_offset)
+{
+    if (!ctx || !ctx->fn || !out_offset)
+        return false;
+
+    const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
+    if (!abi)
+        return false;
+
+    /* System V currently lacks register spill support for varargs. */
+    if (abi->shadow_space_bytes == 0)
+        return false;
+
+    size_t slot_size = cc_value_type_size(CC_TYPE_PTR);
+    if (slot_size == 0)
+        slot_size = 8;
+
+    size_t offset = 16; /* skip saved rbp and return address */
+    size_t named = ctx->fn->param_count;
+    size_t reg_count = abi->int_register_count;
+
+    if (named < reg_count)
+        offset += named * slot_size;
+    else
+        offset += abi->shadow_space_bytes + (named - reg_count) * slot_size;
+
+    *out_offset = offset;
+    return true;
+}
+
 static bool ensure_local_offsets(X86FunctionContext *ctx)
 {
     size_t local_count = ctx->fn->local_count;
@@ -1047,6 +1077,20 @@ static bool emit_load_param(X86FunctionContext *ctx, const CCInstruction *ins)
 static bool emit_addr_param(X86FunctionContext *ctx, const CCInstruction *ins)
 {
     uint32_t index = ins->data.param.index;
+    size_t named_params = ctx->fn->param_count;
+    if (ctx->fn->is_varargs && index == named_params)
+    {
+        size_t offset = 0;
+        if (!x86_vararg_base_offset(ctx, &offset))
+        {
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "addr_param varargs base unsupported on this ABI");
+            return false;
+        }
+        x86_ensure_rax_available(ctx);
+        fprintf(ctx->out, "    lea rax, [rbp+%zu]\n", offset);
+        return emit_push_rax(ctx->out, ctx, CC_TYPE_PTR, true);
+    }
+
     if (index >= ctx->param_count)
     {
         emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "addr_param index %u out of range", index);

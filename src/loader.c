@@ -1980,7 +1980,9 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "invalid parameter index '%s'", index_tok);
             return false;
         }
-        if (index >= fn->param_count)
+        bool is_addr = strcmp(mnemonic, "addr_param") == 0;
+        bool is_vararg_base = is_addr && fn->is_varargs && index == fn->param_count;
+        if (index >= fn->param_count && !is_vararg_base)
         {
             loader_diag(st, CC_DIAG_ERROR, st->line, "parameter index %u out of range", index);
             return false;
