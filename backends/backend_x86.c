@@ -2020,6 +2020,17 @@ static void emit_function_prologue(X86FunctionContext *ctx)
             emit_store_from_rax_to_rbp(ctx, 0, offset, type);
         }
     }
+
+    if (ctx->fn->is_varargs)
+    {
+        size_t slot_count = abi->int_register_count;
+        const char *mem_kw = ctx->syntax->qword_mem_keyword;
+        for (size_t i = 0; i < slot_count; ++i)
+        {
+            size_t home_offset = 16 + i * 8; /* saved rbp + ret addr + ith home slot */
+            fprintf(ctx->out, "    mov %s [rbp + %zu], %s\n", mem_kw, home_offset, abi->reg64[i]);
+        }
+    }
 }
 
 static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
