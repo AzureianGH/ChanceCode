@@ -7,10 +7,11 @@
 #include "diagnostics.h"
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink);
+    bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink);
 
 #ifdef __cplusplus
 }

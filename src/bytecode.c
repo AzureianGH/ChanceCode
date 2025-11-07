@@ -788,7 +788,6 @@ void cc_module_optimize(CCModule *module, int opt_level)
             cc_function_prune_dropped_values(fn);
         }
     }
-
 }
 
 static bool cc_write_u8(FILE *out, uint8_t value)

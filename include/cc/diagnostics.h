@@ -6,31 +6,35 @@
 #include <stddef.h>
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
-typedef enum {
-    CC_DIAG_INFO = 0,
-    CC_DIAG_WARNING,
-    CC_DIAG_ERROR
-} CCDiagnosticSeverity;
+    typedef enum
+    {
+        CC_DIAG_INFO = 0,
+        CC_DIAG_WARNING,
+        CC_DIAG_ERROR
+    } CCDiagnosticSeverity;
 
-typedef struct {
-    CCDiagnosticSeverity severity;
-    size_t line;
-    size_t column;
-    const char *message;
-} CCDiagnostic;
+    typedef struct
+    {
+        CCDiagnosticSeverity severity;
+        size_t line;
+        size_t column;
+        const char *message;
+    } CCDiagnostic;
 
-typedef void (*CCDiagnosticCallback)(const CCDiagnostic *diagnostic, void *userdata);
+    typedef void (*CCDiagnosticCallback)(const CCDiagnostic *diagnostic, void *userdata);
 
-typedef struct {
-    CCDiagnosticCallback callback;
-    void *userdata;
-} CCDiagnosticSink;
+    typedef struct
+    {
+        CCDiagnosticCallback callback;
+        void *userdata;
+    } CCDiagnosticSink;
 
-void cc_diag_init_default(CCDiagnosticSink *sink);
-void cc_diag_emit(CCDiagnosticSink *sink, CCDiagnosticSeverity severity, size_t line, size_t column, const char *fmt, ...);
+    void cc_diag_init_default(CCDiagnosticSink *sink);
+    void cc_diag_emit(CCDiagnosticSink *sink, CCDiagnosticSeverity severity, size_t line, size_t column, const char *fmt, ...);
 
 #ifdef __cplusplus
 }

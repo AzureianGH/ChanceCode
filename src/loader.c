@@ -7,7 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct LoaderState {
+typedef struct LoaderState
+{
     const char *path;
     CCModule *module;
     CCDiagnosticSink *sink;
@@ -1320,12 +1321,24 @@ static bool parse_string_literal(const char *input, char **out_data, size_t *out
             }
             switch (esc)
             {
-            case 'n': ch = '\n'; break;
-            case 'r': ch = '\r'; break;
-            case 't': ch = '\t'; break;
-            case '\\': ch = '\\'; break;
-            case '"': ch = '"'; break;
-            case '0': ch = '\0'; break;
+            case 'n':
+                ch = '\n';
+                break;
+            case 'r':
+                ch = '\r';
+                break;
+            case 't':
+                ch = '\t';
+                break;
+            case '\\':
+                ch = '\\';
+                break;
+            case '"':
+                ch = '"';
+                break;
+            case '0':
+                ch = '\0';
+                break;
             case 'x':
             {
                 if (!isxdigit((unsigned char)src[0]) || !isxdigit((unsigned char)src[1]))
@@ -1333,7 +1346,7 @@ static bool parse_string_literal(const char *input, char **out_data, size_t *out
                     free(buffer);
                     return false;
                 }
-                char hex[3] = { src[0], src[1], '\0' };
+                char hex[3] = {src[0], src[1], '\0'};
                 ch = (char)strtol(hex, NULL, 16);
                 src += 2;
                 break;
@@ -1947,7 +1960,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             ++rest;
         char *data = NULL;
         size_t len = 0;
-    if (!parse_string_literal(rest, &data, &len, NULL))
+        if (!parse_string_literal(rest, &data, &len, NULL))
         {
             loader_diag(st, CC_DIAG_ERROR, st->line, "malformed string literal");
             return false;
@@ -2425,7 +2438,7 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
     }
 
     bool success = true;
-    LoaderState st = { 0 };
+    LoaderState st = {0};
     st.path = path;
     st.module = module;
     st.sink = sink;
@@ -2659,7 +2672,7 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             }
 
             if (!ensure_function_metadata(&st, current_fn, params_set || current_fn->param_count == 0,
-                                           locals_set || current_fn->local_count == 0))
+                                          locals_set || current_fn->local_count == 0))
             {
                 success = false;
                 break;

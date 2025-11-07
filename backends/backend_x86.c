@@ -12,12 +12,14 @@
 
 #define X86_STACK_ALIGNMENT 16
 
-typedef enum {
+typedef enum
+{
     X86_ASM_NASM = 0,
     X86_ASM_GAS
 } X86AsmFlavor;
 
-typedef struct {
+typedef struct
+{
     X86AsmFlavor flavor;
     const char *backend_name;
     const char *backend_description;
@@ -145,25 +147,29 @@ typedef struct
     StackLocation location;
 } StackValue;
 
-typedef struct {
+typedef struct
+{
     char *label;
     const char *data;
     size_t length;
 } X86StringLiteral;
 
-typedef struct {
+typedef struct
+{
     X86StringLiteral *items;
     size_t count;
     size_t capacity;
 } X86StringTable;
 
-typedef struct {
+typedef struct
+{
     char **items;
     size_t count;
     size_t capacity;
 } X86StringSet;
 
-typedef struct {
+typedef struct
+{
     FILE *out;
     const CCModule *module;
     CCDiagnosticSink *sink;
@@ -174,7 +180,8 @@ typedef struct {
     const X86ABIInfo *abi;
 } X86ModuleContext;
 
-typedef struct {
+typedef struct
+{
     X86ModuleContext *module;
     const CCFunction *fn;
     FILE *out;
@@ -623,26 +630,17 @@ static bool x86_vararg_base_offset(const X86FunctionContext *ctx, size_t *out_of
     if (!ctx || !ctx->fn || !out_offset)
         return false;
 
-    const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
-    if (!abi)
-        return false;
-
-    /* System V currently lacks register spill support for varargs. */
-    if (abi->shadow_space_bytes == 0)
-        return false;
-
     size_t slot_size = cc_value_type_size(CC_TYPE_PTR);
     if (slot_size == 0)
         slot_size = 8;
 
+    /*
+     * All arguments (including named ones) are staged consecutively by the
+     * caller inside the home area located above the return address. The first
+     * vararg lives immediately after the named parameters.
+     */
     size_t offset = 16; /* skip saved rbp and return address */
-    size_t named = ctx->fn->param_count;
-    size_t reg_count = abi->int_register_count;
-
-    if (named < reg_count)
-        offset += named * slot_size;
-    else
-        offset += abi->shadow_space_bytes + (named - reg_count) * slot_size;
+    offset += (size_t)ctx->fn->param_count * slot_size;
 
     *out_offset = offset;
     return true;
@@ -1459,12 +1457,24 @@ static bool emit_compare(X86FunctionContext *ctx, const CCInstruction *ins)
     const char *set_instr = NULL;
     switch (ins->data.compare.op)
     {
-    case CC_COMPARE_EQ: set_instr = "sete"; break;
-    case CC_COMPARE_NE: set_instr = "setne"; break;
-    case CC_COMPARE_LT: set_instr = is_unsigned ? "setb" : "setl"; break;
-    case CC_COMPARE_LE: set_instr = is_unsigned ? "setbe" : "setle"; break;
-    case CC_COMPARE_GT: set_instr = is_unsigned ? "seta" : "setg"; break;
-    case CC_COMPARE_GE: set_instr = is_unsigned ? "setae" : "setge"; break;
+    case CC_COMPARE_EQ:
+        set_instr = "sete";
+        break;
+    case CC_COMPARE_NE:
+        set_instr = "setne";
+        break;
+    case CC_COMPARE_LT:
+        set_instr = is_unsigned ? "setb" : "setl";
+        break;
+    case CC_COMPARE_LE:
+        set_instr = is_unsigned ? "setbe" : "setle";
+        break;
+    case CC_COMPARE_GT:
+        set_instr = is_unsigned ? "seta" : "setg";
+        break;
+    case CC_COMPARE_GE:
+        set_instr = is_unsigned ? "setae" : "setge";
+        break;
     default:
         emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "unsupported compare op %d", ins->data.compare.op);
         return false;
@@ -1635,87 +1645,197 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
 
     const StackValue *args = ctx->stack + (ctx->stack_size - arg_count);
     const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
-    size_t reg_count = abi->int_register_count;
-    size_t stack_args = arg_count > reg_count ? arg_count - reg_count : 0;
-    size_t base_call_area = abi->shadow_space_bytes + stack_args * 8;
+    bool is_varargs = module_symbol_is_varargs(ctx->module->module, ins->data.call.symbol);
+
+    typedef enum
+    {
+        CALL_ARG_LOC_GP = 0,
+        CALL_ARG_LOC_FP,
+        CALL_ARG_LOC_STACK
+    } CallArgLocation;
+
+    typedef struct
+    {
+        CCValueType original_type;
+        CCValueType pass_type;
+        bool is_unsigned;
+        bool promote_f32;
+        CallArgLocation location;
+        size_t gp_index;
+        size_t fp_index;
+        size_t stack_index;
+        size_t spill_slot;
+    } CallArgInfo;
+
+    CallArgInfo *arg_info = NULL;
+    if (arg_count > 0)
+    {
+        arg_info = (CallArgInfo *)calloc(arg_count, sizeof(CallArgInfo));
+        if (!arg_info)
+        {
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "out of memory while preparing call arguments");
+            return false;
+        }
+    }
+
+    size_t gp_used = 0;
+    size_t fp_used = 0;
+    size_t stack_used = 0;
+    size_t spill_slots = 0;
+    for (size_t i = 0; i < arg_count; ++i)
+    {
+        CCValueType arg_type = ins->data.call.arg_types ? ins->data.call.arg_types[i] : CC_TYPE_I64;
+        bool promote_f32 = is_varargs && arg_type == CC_TYPE_F32;
+        CCValueType pass_type = promote_f32 ? CC_TYPE_F64 : arg_type;
+        bool is_float = (pass_type == CC_TYPE_F32) || (pass_type == CC_TYPE_F64);
+
+        bool use_fp = (ctx->abi == &kX86AbiSystemV) && is_float && fp_used < abi->float_register_count;
+        bool use_gp = (!use_fp) && (gp_used < abi->int_register_count);
+
+        CallArgInfo info;
+        memset(&info, 0, sizeof(info));
+        info.original_type = arg_type;
+        info.pass_type = pass_type;
+        info.promote_f32 = promote_f32;
+        info.is_unsigned = !cc_value_type_is_signed(pass_type) && args[i].is_unsigned;
+        info.spill_slot = SIZE_MAX;
+
+        if (use_fp)
+        {
+            info.location = CALL_ARG_LOC_FP;
+            info.fp_index = fp_used++;
+            info.spill_slot = spill_slots++;
+        }
+        else if (use_gp)
+        {
+            info.location = CALL_ARG_LOC_GP;
+            info.gp_index = gp_used++;
+            info.spill_slot = spill_slots++;
+        }
+        else
+        {
+            info.location = CALL_ARG_LOC_STACK;
+            info.stack_index = stack_used++;
+        }
+
+        arg_info[i] = info;
+    }
+
+    size_t register_save_bytes = abi->shadow_space_bytes;
+    bool spill_register_args = false;
+    if (is_varargs)
+    {
+        spill_register_args = true;
+        if (ctx->abi == &kX86AbiSystemV)
+            register_save_bytes = spill_slots * 8;
+        else if (ctx->abi == &kX86AbiWin64)
+            register_save_bytes = abi->shadow_space_bytes;
+        else
+            register_save_bytes = spill_slots * 8;
+    }
+
+    size_t base_call_area = register_save_bytes + stack_used * 8;
     size_t spill_bytes = ctx->stack_size * 8;
     size_t prologue_bytes = ctx->use_frame ? ctx->frame_size + 8 : 0;
-    size_t entry_bias = 8; // return address pushed by caller
-    size_t current_offset = entry_bias + prologue_bytes + spill_bytes;
-    size_t total_for_alignment = current_offset + base_call_area;
+    size_t entry_bias = 8;
+    size_t total_for_alignment = entry_bias + prologue_bytes + spill_bytes + base_call_area;
     size_t remainder = total_for_alignment % X86_STACK_ALIGNMENT;
     size_t align_padding = remainder ? (X86_STACK_ALIGNMENT - remainder) : 0;
     size_t call_frame_size = base_call_area + align_padding;
     bool is_noreturn = module_symbol_is_noreturn(ctx->module->module, ins->data.call.symbol);
-    bool is_varargs = module_symbol_is_varargs(ctx->module->module, ins->data.call.symbol);
-    bool needs_shadow_spills = is_varargs && ctx->abi == &kX86AbiWin64;
+
     if (call_frame_size > 0)
         fprintf(ctx->out, "    sub rsp, %zu\n", call_frame_size);
 
     for (size_t i = 0; i < arg_count; ++i)
     {
-        size_t offset = call_frame_size + (arg_count - 1 - i) * 8;
-        CCValueType arg_type = ins->data.call.arg_types ? ins->data.call.arg_types[i] : CC_TYPE_I64;
-        bool promote_f32 = is_varargs && arg_type == CC_TYPE_F32;
-        CCValueType pass_type = promote_f32 ? CC_TYPE_F64 : arg_type;
-        bool is_unsigned = !cc_value_type_is_signed(pass_type) && args[i].is_unsigned;
+        CallArgInfo *info = arg_info ? &arg_info[i] : NULL;
+        size_t src_offset = call_frame_size + (arg_count - 1 - i) * 8;
 
-        if (promote_f32)
+        if (info && info->promote_f32)
         {
-            fprintf(ctx->out, "    movss xmm7, %s [rsp + %zu]\n", ctx->syntax->dword_mem_keyword, offset);
+            fprintf(ctx->out, "    movss xmm7, %s [rsp + %zu]\n", ctx->syntax->dword_mem_keyword, src_offset);
             fprintf(ctx->out, "    cvtss2sd xmm7, xmm7\n");
-            fprintf(ctx->out, "    movsd %s [rsp + %zu], xmm7\n", ctx->syntax->qword_mem_keyword, offset);
+            fprintf(ctx->out, "    movsd %s [rsp + %zu], xmm7\n", ctx->syntax->qword_mem_keyword, src_offset);
+            info->pass_type = CC_TYPE_F64;
         }
+
+        if (info && info->location == CALL_ARG_LOC_FP)
+        {
+            const char *xmm_reg = abi->xmm[info->fp_index];
+            if (info->pass_type == CC_TYPE_F32)
+                fprintf(ctx->out, "    movss %s, %s [rsp + %zu]\n", xmm_reg, ctx->syntax->dword_mem_keyword, src_offset);
+            else
+                fprintf(ctx->out, "    movsd %s, %s [rsp + %zu]\n", xmm_reg, ctx->syntax->qword_mem_keyword, src_offset);
+
+            if (spill_register_args && info->spill_slot != SIZE_MAX)
+            {
+                size_t spill_offset = info->spill_slot * 8;
+                fprintf(ctx->out, "    movsd %s [rsp + %zu], %s\n", ctx->syntax->qword_mem_keyword, spill_offset, xmm_reg);
+            }
+            continue;
+        }
+
+        CCValueType pass_type = info ? info->pass_type : CC_TYPE_I64;
+        bool is_unsigned = info ? info->is_unsigned : false;
 
         switch (pass_type)
         {
         case CC_TYPE_I1:
         case CC_TYPE_U8:
         case CC_TYPE_I8:
-            fprintf(ctx->out, "    movzx eax, %s [rsp + %zu]\n", ctx->syntax->byte_mem_keyword, offset);
-            if (!is_unsigned && arg_type != CC_TYPE_U8)
+            fprintf(ctx->out, "    movzx eax, %s [rsp + %zu]\n", ctx->syntax->byte_mem_keyword, src_offset);
+            if (!is_unsigned && pass_type != CC_TYPE_U8)
                 fprintf(ctx->out, "    movsx eax, al\n");
             break;
         case CC_TYPE_I16:
         case CC_TYPE_U16:
             if (is_unsigned)
-                fprintf(ctx->out, "    movzx eax, %s [rsp + %zu]\n", ctx->syntax->word_mem_keyword, offset);
+                fprintf(ctx->out, "    movzx eax, %s [rsp + %zu]\n", ctx->syntax->word_mem_keyword, src_offset);
             else
-                fprintf(ctx->out, "    movsx eax, %s [rsp + %zu]\n", ctx->syntax->word_mem_keyword, offset);
+                fprintf(ctx->out, "    movsx eax, %s [rsp + %zu]\n", ctx->syntax->word_mem_keyword, src_offset);
             break;
         case CC_TYPE_I32:
         case CC_TYPE_U32:
         case CC_TYPE_F32:
             if (is_unsigned)
-                fprintf(ctx->out, "    mov eax, %s [rsp + %zu]\n", ctx->syntax->dword_mem_keyword, offset);
+                fprintf(ctx->out, "    mov eax, %s [rsp + %zu]\n", ctx->syntax->dword_mem_keyword, src_offset);
             else
-                fprintf(ctx->out, "    movsxd rax, %s [rsp + %zu]\n", ctx->syntax->dword_mem_keyword, offset);
+                fprintf(ctx->out, "    movsxd rax, %s [rsp + %zu]\n", ctx->syntax->dword_mem_keyword, src_offset);
             break;
         default:
-            fprintf(ctx->out, "    mov rax, %s [rsp + %zu]\n", ctx->syntax->qword_mem_keyword, offset);
+            fprintf(ctx->out, "    mov rax, %s [rsp + %zu]\n", ctx->syntax->qword_mem_keyword, src_offset);
             break;
         }
 
-        if (i < reg_count)
+        if (info && info->location == CALL_ARG_LOC_GP)
         {
-            const char *reg64 = abi->reg64[i];
+            const char *reg64 = abi->reg64[info->gp_index];
             fprintf(ctx->out, "    mov %s, rax\n", reg64);
-            if (needs_shadow_spills)
+            if (spill_register_args && info->spill_slot != SIZE_MAX)
             {
-                size_t shadow_offset = i * 8;
-                // Windows varargs expect register arguments mirrored in the shadow space.
-                fprintf(ctx->out, "    mov %s [rsp + %zu], %s\n", ctx->syntax->qword_mem_keyword, shadow_offset, reg64);
+                size_t spill_offset = info->spill_slot * 8;
+                fprintf(ctx->out, "    mov %s [rsp + %zu], %s\n", ctx->syntax->qword_mem_keyword, spill_offset, reg64);
             }
         }
-        else
+        else if (info)
         {
-            size_t slot = abi->shadow_space_bytes + (i - reg_count) * 8;
+            size_t slot = register_save_bytes + info->stack_index * 8;
             fprintf(ctx->out, "    mov %s [rsp + %zu], rax\n", ctx->syntax->qword_mem_keyword, slot);
         }
     }
 
     if (is_varargs && ctx->abi == &kX86AbiSystemV)
-        fprintf(ctx->out, "    xor eax, eax\n");
+    {
+        size_t vector_count = fp_used;
+        if (vector_count > abi->float_register_count)
+            vector_count = abi->float_register_count;
+        /* SysV ABI: %al conveys how many XMM registers carry arguments. */
+        if (vector_count == 0)
+            fprintf(ctx->out, "    xor eax, eax\n");
+        else
+            fprintf(ctx->out, "    mov eax, %zu\n", vector_count);
+    }
 
     fprintf(ctx->out, "    call %s\n", ins->data.call.symbol);
 
@@ -1732,23 +1852,26 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
         ctx->stack_depth = 0;
         ctx->terminated = true;
         ctx->saw_return = true;
+        free(arg_info);
         return true;
     }
 
     if (call_frame_size > 0)
         fprintf(ctx->out, "    add rsp, %zu\n", call_frame_size);
     if (arg_count > 0)
-    {
         fprintf(ctx->out, "    add rsp, %zu\n", arg_count * 8);
-    }
 
     if (ins->data.call.return_type != CC_TYPE_VOID)
     {
         emit_truncate_rax(ctx->out, ins->data.call.return_type, !cc_value_type_is_signed(ins->data.call.return_type));
         if (!emit_push_rax(ctx->out, ctx, ins->data.call.return_type, !cc_value_type_is_signed(ins->data.call.return_type)))
+        {
+            free(arg_info);
             return false;
+        }
     }
 
+    free(arg_info);
     return true;
 }
 
@@ -1922,6 +2045,8 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
     }
 
     ctx.use_frame = (ctx.frame_size > 0) || (ctx.param_count > 0);
+    if (fn->is_varargs)
+        ctx.use_frame = true;
     if (!ctx.use_frame)
     {
         for (size_t i = 0; i < fn->instruction_count; ++i)
