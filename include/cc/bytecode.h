@@ -96,7 +96,8 @@ extern "C"
         CC_INSTR_BRANCH,
         CC_INSTR_CALL,
         CC_INSTR_RET,
-        CC_INSTR_COMMENT
+        CC_INSTR_COMMENT,
+        CC_INSTR_CALL_INDIRECT
     } CCInstrKind;
 
     typedef enum
@@ -242,7 +243,7 @@ extern "C"
                 CCValueType return_type;
                 CCValueType *arg_types;
                 size_t arg_count;
-                bool is_tail_call;
+                bool is_varargs;
             } call;
             struct
             {

@@ -1782,6 +1782,7 @@ static bool cc_write_instruction(FILE *out, const CCInstruction *ins)
             return false;
         return true;
     case CC_INSTR_CALL:
+    case CC_INSTR_CALL_INDIRECT:
     {
         if (!cc_write_string(out, ins->data.call.symbol))
             return false;
@@ -1792,7 +1793,7 @@ static bool cc_write_instruction(FILE *out, const CCInstruction *ins)
             return false;
         if (arg_count > 0 && !cc_write_value_type_array(out, ins->data.call.arg_types, arg_count))
             return false;
-        if (!cc_write_bool(out, ins->data.call.is_tail_call))
+        if (!cc_write_bool(out, ins->data.call.is_varargs))
             return false;
         return true;
     }

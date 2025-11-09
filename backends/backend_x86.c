@@ -1986,17 +1986,44 @@ static bool emit_branch(X86FunctionContext *ctx, const CCInstruction *ins)
 
 static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
 {
+    bool is_indirect = (ins->kind == CC_INSTR_CALL_INDIRECT) || (ins->data.call.symbol == NULL);
+    bool pointer_in_r11 = false;
+#define CALL_FAIL_RETURN()                                                                 \
+    do                                                                                     \
+    {                                                                                      \
+        if (pointer_in_r11)                                                                 \
+            ctx->reg_r11_in_use = false;                                                   \
+        return false;                                                                       \
+    } while (0)
     x86_flush_virtual_stack(ctx);
     size_t arg_count = ins->data.call.arg_count;
-    if (ctx->stack_size < arg_count)
+    size_t required_values = arg_count + (is_indirect ? 1 : 0);
+    if (ctx->stack_size < required_values)
     {
-        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "call '%s' missing %zu arguments", ins->data.call.symbol, arg_count);
-        return false;
+        const char *name = ins->data.call.symbol ? ins->data.call.symbol : "<indirect>";
+    emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "call '%s' missing %zu argument%s", name, arg_count, arg_count == 1 ? "" : "s");
+        CALL_FAIL_RETURN();
+    }
+    const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
+    if (is_indirect)
+    {
+        fprintf(ctx->out, "    pop rax\n");
+        fprintf(ctx->out, "    mov r11, rax\n");
+        ctx->reg_r11_in_use = true;
+        pointer_in_r11 = true;
+        if (ctx->stack_size > 0)
+            ctx->stack_size -= 1;
+        if (ctx->stack_depth > 0)
+            ctx->stack_depth -= 1;
     }
 
-    const StackValue *args = ctx->stack + (ctx->stack_size - arg_count);
-    const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
-    bool is_varargs = module_symbol_is_varargs(ctx->module->module, ins->data.call.symbol);
+    const StackValue *args = NULL;
+    if (arg_count > 0)
+        args = ctx->stack + (ctx->stack_size - arg_count);
+
+    bool is_varargs = ins->data.call.is_varargs;
+    if (!is_indirect && ins->data.call.symbol)
+        is_varargs = module_symbol_is_varargs(ctx->module->module, ins->data.call.symbol);
 
     typedef enum
     {
@@ -2025,7 +2052,7 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
         if (!arg_info)
         {
             emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "out of memory while preparing call arguments");
-            return false;
+            CALL_FAIL_RETURN();
         }
     }
 
@@ -2093,7 +2120,9 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     size_t remainder = total_for_alignment % X86_STACK_ALIGNMENT;
     size_t align_padding = remainder ? (X86_STACK_ALIGNMENT - remainder) : 0;
     size_t call_frame_size = base_call_area + align_padding;
-    bool is_noreturn = module_symbol_is_noreturn(ctx->module->module, ins->data.call.symbol);
+    bool is_noreturn = false;
+    if (!is_indirect && ins->data.call.symbol)
+        is_noreturn = module_symbol_is_noreturn(ctx->module->module, ins->data.call.symbol);
 
     if (call_frame_size > 0)
         fprintf(ctx->out, "    sub rsp, %zu\n", call_frame_size);
@@ -2188,7 +2217,15 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
             fprintf(ctx->out, "    mov eax, %zu\n", vector_count);
     }
 
-    fprintf(ctx->out, "    call %s\n", ins->data.call.symbol);
+    if (is_indirect)
+    {
+        fprintf(ctx->out, "    call r11\n");
+        ctx->reg_r11_in_use = false;
+    }
+    else
+    {
+        fprintf(ctx->out, "    call %s\n", ins->data.call.symbol);
+    }
 
     if (ctx->stack_size >= arg_count)
         ctx->stack_size -= arg_count;
@@ -2217,11 +2254,12 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
         if (!emit_push_rax(ctx->out, ctx, ins->data.call.return_type, !cc_value_type_is_signed(ins->data.call.return_type)))
         {
             free(arg_info);
-            return false;
+            CALL_FAIL_RETURN();
         }
     }
 
     free(arg_info);
+#undef CALL_FAIL_RETURN
     return true;
 }
 
@@ -2310,6 +2348,7 @@ static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
     case CC_INSTR_BRANCH:
         return emit_branch(ctx, ins);
     case CC_INSTR_CALL:
+    case CC_INSTR_CALL_INDIRECT:
         return emit_call(ctx, ins);
     case CC_INSTR_RET:
         return emit_ret(ctx, ins);

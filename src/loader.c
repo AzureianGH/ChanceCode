@@ -7,6 +7,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct PendingAddrGlobal
+{
+    char *name;
+    size_t line;
+} PendingAddrGlobal;
+
 typedef struct LoaderState
 {
     const char *path;
@@ -17,8 +23,12 @@ typedef struct LoaderState
     char **pending_noreturn;
     size_t pending_noreturn_count;
     size_t pending_noreturn_capacity;
+    PendingAddrGlobal *pending_addr_globals;
+    size_t pending_addr_global_count;
+    size_t pending_addr_global_capacity;
 } LoaderState;
 
+static CCGlobal *find_global(CCModule *module, const char *name);
 static CCFunction *find_function(CCModule *module, const char *name);
 static char *duplicate_token(const char *token);
 
@@ -51,6 +61,18 @@ static void pending_noreturn_destroy(LoaderState *st)
     st->pending_noreturn = NULL;
     st->pending_noreturn_count = 0;
     st->pending_noreturn_capacity = 0;
+}
+
+static void pending_addr_globals_destroy(LoaderState *st)
+{
+    if (!st || !st->pending_addr_globals)
+        return;
+    for (size_t i = 0; i < st->pending_addr_global_count; ++i)
+        free(st->pending_addr_globals[i].name);
+    free(st->pending_addr_globals);
+    st->pending_addr_globals = NULL;
+    st->pending_addr_global_count = 0;
+    st->pending_addr_global_capacity = 0;
 }
 
 static bool mark_symbol_noreturn(LoaderState *st, const char *name)
@@ -92,6 +114,28 @@ static bool pending_noreturn_add(LoaderState *st, const char *name)
     return true;
 }
 
+static bool pending_addr_globals_add(LoaderState *st, const char *name, size_t line)
+{
+    if (!st || !name || *name == '\0')
+        return false;
+    if (st->pending_addr_global_count == st->pending_addr_global_capacity)
+    {
+        size_t new_cap = st->pending_addr_global_capacity ? st->pending_addr_global_capacity * 2 : 4;
+        PendingAddrGlobal *new_list = (PendingAddrGlobal *)realloc(st->pending_addr_globals, new_cap * sizeof(PendingAddrGlobal));
+        if (!new_list)
+            return false;
+        st->pending_addr_globals = new_list;
+        st->pending_addr_global_capacity = new_cap;
+    }
+    char *copy = duplicate_token(name);
+    if (!copy)
+        return false;
+    st->pending_addr_globals[st->pending_addr_global_count].name = copy;
+    st->pending_addr_globals[st->pending_addr_global_count].line = line;
+    st->pending_addr_global_count++;
+    return true;
+}
+
 static void resolve_pending_noreturn(LoaderState *st, const char *name)
 {
     if (!st || !name)
@@ -110,6 +154,29 @@ static void resolve_pending_noreturn(LoaderState *st, const char *name)
             break;
         }
     }
+}
+
+static bool resolve_pending_addr_globals(LoaderState *st)
+{
+    if (!st || st->pending_addr_global_count == 0)
+        return true;
+
+    bool ok = true;
+    for (size_t i = 0; i < st->pending_addr_global_count; ++i)
+    {
+        const PendingAddrGlobal *entry = &st->pending_addr_globals[i];
+        if (!entry->name)
+            continue;
+        if (find_global(st->module, entry->name))
+            continue;
+        if (find_function(st->module, entry->name))
+            continue;
+        if (cc_module_find_extern(st->module, entry->name))
+            continue;
+        loader_diag(st, CC_DIAG_ERROR, entry->line, "unknown symbol '%s' referenced by addr_global", entry->name);
+        ok = false;
+    }
+    return ok;
 }
 
 static void reset_global_init(CCGlobalInit *init)
@@ -1209,13 +1276,20 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
                 break;
             }
             case CC_INSTR_CALL:
+            case CC_INSTR_CALL_INDIRECT:
             {
                 char *symbol = NULL;
-                if (!ccbin_read_cstring(file, &symbol, false))
+                bool allow_empty_symbol = (ins->kind == CC_INSTR_CALL_INDIRECT);
+                if (!ccbin_read_cstring(file, &symbol, allow_empty_symbol))
                 {
                     if (sink)
                         cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid call symbol in function index %zu", i);
                     goto fail;
+                }
+                if (allow_empty_symbol && symbol && symbol[0] == '\0')
+                {
+                    free(symbol);
+                    symbol = NULL;
                 }
                 CCValueType ret_ty = CC_TYPE_VOID;
                 if (!ccbin_read_value_type(file, &ret_ty))
@@ -1241,8 +1315,8 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
                         cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid call arg types in function index %zu", i);
                     goto fail;
                 }
-                bool is_tail = false;
-                if (!ccbin_read_bool(file, &is_tail))
+                bool is_varargs = false;
+                if (!ccbin_read_bool(file, &is_varargs))
                 {
                     free(symbol);
                     free(arg_types);
@@ -1254,7 +1328,7 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
                 ins->data.call.return_type = ret_ty;
                 ins->data.call.arg_types = arg_types;
                 ins->data.call.arg_count = arg_count;
-                ins->data.call.is_tail_call = is_tail;
+                ins->data.call.is_varargs = is_varargs;
                 break;
             }
             case CC_INSTR_RET:
@@ -2048,22 +2122,44 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "expected global symbol name");
             return false;
         }
+
+        bool is_addr = strcmp(mnemonic, "addr_global") == 0;
         CCGlobal *global = find_global(st->module, symbol);
         if (!global)
         {
-            loader_diag(st, CC_DIAG_ERROR, st->line, "unknown global '%s'", symbol);
-            return false;
+            if (!is_addr)
+            {
+                loader_diag(st, CC_DIAG_ERROR, st->line, "unknown global '%s'", symbol);
+                return false;
+            }
+
+            if (!find_function(st->module, symbol) && !cc_module_find_extern(st->module, symbol))
+            {
+                if (!pending_addr_globals_add(st, symbol, st->line))
+                {
+                    loader_diag(st, CC_DIAG_ERROR, st->line, "failed to record addr_global reference to '%s'", symbol);
+                    return false;
+                }
+            }
         }
+
         CCInstrKind kind = CC_INSTR_LOAD_GLOBAL;
         if (strcmp(mnemonic, "store_global") == 0)
             kind = CC_INSTR_STORE_GLOBAL;
-        else if (strcmp(mnemonic, "addr_global") == 0)
+        else if (is_addr)
             kind = CC_INSTR_ADDR_GLOBAL;
+
+        if ((kind == CC_INSTR_LOAD_GLOBAL || kind == CC_INSTR_STORE_GLOBAL) && !global)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "instruction '%s' requires declared global '%s'", mnemonic, symbol);
+            return false;
+        }
+
         ins = cc_function_append_instruction(fn, kind, st->line);
         if (!ins)
             return false;
         ins->data.global.symbol = duplicate_token(symbol);
-        ins->data.global.type = (kind == CC_INSTR_ADDR_GLOBAL) ? CC_TYPE_PTR : global->type;
+        ins->data.global.type = (kind == CC_INSTR_ADDR_GLOBAL || !global) ? CC_TYPE_PTR : global->type;
         return true;
     }
 
@@ -2306,6 +2402,58 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
         return true;
     }
 
+    if (strcmp(mnemonic, "call_indirect") == 0)
+    {
+        const char *ret_type = strtok(NULL, " \t");
+        const char *args_tok = strtok(NULL, " \t");
+        const char *flag_tok = strtok(NULL, " \t");
+        if (!ret_type || !args_tok)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "call_indirect requires <ret> (<args>)");
+            return false;
+        }
+        bool is_varargs = false;
+        if (flag_tok)
+        {
+            if (strcmp(flag_tok, "varargs") == 0)
+            {
+                is_varargs = true;
+                if (strtok(NULL, " \t"))
+                {
+                    loader_diag(st, CC_DIAG_ERROR, st->line, "unexpected tokens after call_indirect varargs flag");
+                    return false;
+                }
+            }
+            else
+            {
+                loader_diag(st, CC_DIAG_ERROR, st->line, "unexpected token '%s' for call_indirect", flag_tok);
+                return false;
+            }
+        }
+        CCValueType ret_ty = parse_type_token(ret_type);
+        if (ret_ty == CC_TYPE_INVALID)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "invalid return type '%s'", ret_type);
+            return false;
+        }
+        CCValueType *arg_types = NULL;
+        size_t arg_count = 0;
+        if (!parse_type_list(st, args_tok, &arg_types, &arg_count))
+            return false;
+        ins = cc_function_append_instruction(fn, CC_INSTR_CALL_INDIRECT, st->line);
+        if (!ins)
+        {
+            free(arg_types);
+            return false;
+        }
+        ins->data.call.symbol = NULL;
+        ins->data.call.return_type = ret_ty;
+        ins->data.call.arg_types = arg_types;
+        ins->data.call.arg_count = arg_count;
+        ins->data.call.is_varargs = is_varargs;
+        return true;
+    }
+
     if (strcmp(mnemonic, "call") == 0)
     {
         const char *symbol = strtok(NULL, " \t");
@@ -2338,7 +2486,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
         ins->data.call.return_type = ret_ty;
         ins->data.call.arg_types = arg_types;
         ins->data.call.arg_count = arg_count;
-        ins->data.call.is_tail_call = false;
+        ins->data.call.is_varargs = false;
         return true;
     }
 
@@ -2745,9 +2893,13 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
         }
     }
 
+    if (success && !resolve_pending_addr_globals(&st))
+        success = false;
+
     fclose(file);
 
     pending_noreturn_destroy(&st);
+    pending_addr_globals_destroy(&st);
 
     if (!success)
         cc_module_free(module);
