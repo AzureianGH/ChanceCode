@@ -1121,9 +1121,6 @@ static bool emit_load_const(X86FunctionContext *ctx, const CCInstruction *ins)
     bool is_unsigned = ins->data.constant.is_unsigned;
     x86_ensure_rax_available(ctx);
 
-    bool mark_constant = false;
-    uint64_t constant_bits = 0;
-
     if (type == CC_TYPE_F32)
     {
         union
@@ -1147,20 +1144,16 @@ static bool emit_load_const(X86FunctionContext *ctx, const CCInstruction *ins)
     else if (type == CC_TYPE_PTR && ins->data.constant.is_null)
     {
         fprintf(ctx->out, "    xor rax, rax\n");
-        mark_constant = true;
-        constant_bits = 0;
     }
     else if (is_unsigned)
     {
-        fprintf(ctx->out, "    mov rax, 0x%llx\n", (unsigned long long)ins->data.constant.value.u64);
-        mark_constant = true;
-        constant_bits = ins->data.constant.value.u64;
+        unsigned long long raw = (unsigned long long)ins->data.constant.value.u64;
+        fprintf(ctx->out, "    mov rax, 0x%llx\n", raw);
     }
     else
     {
-        fprintf(ctx->out, "    mov rax, %lld\n", (long long)ins->data.constant.value.i64);
-        mark_constant = true;
-        constant_bits = (uint64_t)ins->data.constant.value.i64;
+        long long raw = (long long)ins->data.constant.value.i64;
+        fprintf(ctx->out, "    mov rax, %lld\n", raw);
     }
 
     if (!emit_push_rax(ctx->out, ctx, type, is_unsigned))
@@ -1169,16 +1162,47 @@ static bool emit_load_const(X86FunctionContext *ctx, const CCInstruction *ins)
     StackValue *slot = function_stack_peek(ctx, 0);
     if (slot)
     {
-        if (mark_constant && !cc_value_type_is_float(type))
+        if (!cc_value_type_is_float(type))
         {
-            size_t bit_width = cc_value_type_size(type) * 8;
-            if (bit_width > 0 && bit_width < 64)
+            uint64_t bits = 0;
+            bool has_bits = true;
+            if (type == CC_TYPE_PTR)
             {
-                uint64_t mask = ((uint64_t)1 << bit_width) - 1;
-                constant_bits &= mask;
+                if (ins->data.constant.is_null)
+                    bits = 0;
+                else
+                    bits = ins->data.constant.value.u64;
             }
-            slot->is_constant = true;
-            slot->constant_u64 = constant_bits;
+            else if (is_unsigned)
+            {
+                bits = ins->data.constant.value.u64;
+            }
+            else
+            {
+                bits = (uint64_t)ins->data.constant.value.i64;
+            }
+
+            size_t bit_width = cc_value_type_size(type) * 8;
+            if (bit_width == 0)
+            {
+                has_bits = false;
+            }
+            else if (bit_width < 64)
+            {
+                uint64_t mask = (UINT64_C(1) << bit_width) - 1;
+                bits &= mask;
+            }
+
+            if (has_bits)
+            {
+                slot->is_constant = true;
+                slot->constant_u64 = bits;
+            }
+            else
+            {
+                slot->is_constant = false;
+                slot->constant_u64 = 0;
+            }
         }
         else
         {
@@ -1744,18 +1768,29 @@ static bool emit_compare(X86FunctionContext *ctx, const CCInstruction *ins)
         return false;
     }
 
-    bool rhs_is_zero = rhs.is_constant && rhs.constant_u64 == 0;
-    if (!rhs_is_zero)
+    bool rhs_use_immediate = false;
+    int32_t rhs_imm32 = 0;
+    if (rhs.is_constant)
+    {
+        int64_t imm64 = (int64_t)rhs.constant_u64;
+        if (imm64 >= INT32_MIN && imm64 <= INT32_MAX)
+        {
+            rhs_use_immediate = true;
+            rhs_imm32 = (int32_t)imm64;
+        }
+    }
+
+    if (rhs_use_immediate)
+    {
+        x86_discard_popped_value(ctx, &rhs);
+    }
+    else
     {
         if (!x86_materialize_popped_value(ctx, &rhs, "rbx"))
         {
             emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "failed to materialize compare RHS");
             return false;
         }
-    }
-    else
-    {
-        x86_discard_popped_value(ctx, &rhs);
     }
 
     StackValue lhs;
@@ -1765,8 +1800,8 @@ static bool emit_compare(X86FunctionContext *ctx, const CCInstruction *ins)
         return false;
     }
 
-    if (rhs_is_zero)
-        fprintf(ctx->out, "    cmp rax, 0\n");
+    if (rhs_use_immediate)
+        fprintf(ctx->out, "    cmp rax, %d\n", rhs_imm32);
     else
         fprintf(ctx->out, "    cmp rax, rbx\n");
     bool is_unsigned = ins->data.compare.is_unsigned || !cc_value_type_is_signed(ins->data.compare.type);
