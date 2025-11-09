@@ -4,6 +4,7 @@
 
 #include <ctype.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -145,6 +146,8 @@ typedef struct
     CCValueType type;
     bool is_unsigned;
     StackLocation location;
+    bool is_constant;
+    uint64_t constant_u64;
 } StackValue;
 
 typedef struct
@@ -180,6 +183,12 @@ typedef struct
     const X86ABIInfo *abi;
 } X86ModuleContext;
 
+typedef struct X86ParamInfo
+{
+    bool needs_home;
+    bool consumed;
+} X86ParamInfo;
+
 typedef struct
 {
     X86ModuleContext *module;
@@ -193,9 +202,11 @@ typedef struct
     size_t stack_capacity;
     int stack_depth;
     int32_t *param_offsets;
+    X86ParamInfo *param_info;
     int32_t *local_offsets;
     size_t param_count;
     size_t local_count;
+    size_t home_param_stack_bytes;
     size_t frame_size;
     bool saw_return;
     bool reg_r10_in_use;
@@ -471,6 +482,8 @@ static bool function_stack_push(X86FunctionContext *ctx, CCValueType type, bool 
     ctx->stack[ctx->stack_size].type = type;
     ctx->stack[ctx->stack_size].is_unsigned = is_unsigned;
     ctx->stack[ctx->stack_size].location = STACK_LOC_NONE;
+    ctx->stack[ctx->stack_size].is_constant = false;
+    ctx->stack[ctx->stack_size].constant_u64 = 0;
     ++ctx->stack_size;
     ++ctx->stack_depth;
     return true;
@@ -603,25 +616,134 @@ static void x86_flush_virtual_stack(X86FunctionContext *ctx)
     }
 }
 
-static bool ensure_param_offsets(X86FunctionContext *ctx)
+static bool analyze_param_usage(X86FunctionContext *ctx)
 {
     size_t param_count = ctx->fn->param_count;
+    ctx->param_count = param_count;
+    ctx->home_param_stack_bytes = 0;
     if (param_count == 0)
     {
-        ctx->param_offsets = NULL;
-        ctx->param_count = 0;
+        ctx->param_info = NULL;
         return true;
     }
-    ctx->param_offsets = (int32_t *)malloc(sizeof(int32_t) * param_count);
-    if (!ctx->param_offsets)
+
+    ctx->param_info = (X86ParamInfo *)calloc(param_count, sizeof(X86ParamInfo));
+    if (!ctx->param_info)
         return false;
-    size_t offset = 0;
+
+    size_t *load_counts = (size_t *)calloc(param_count, sizeof(size_t));
+    if (!load_counts)
+    {
+        free(ctx->param_info);
+        ctx->param_info = NULL;
+        return false;
+    }
+
+    if (ctx->fn->is_varargs)
+    {
+        for (size_t i = 0; i < param_count; ++i)
+            ctx->param_info[i].needs_home = true;
+    }
+
+    for (size_t i = 0; i < ctx->fn->instruction_count; ++i)
+    {
+        const CCInstruction *ins = &ctx->fn->instructions[i];
+        switch (ins->kind)
+        {
+        case CC_INSTR_LOAD_PARAM:
+            if (ins->data.param.index < param_count)
+                load_counts[ins->data.param.index]++;
+            break;
+        case CC_INSTR_ADDR_PARAM:
+            if (ins->data.param.index < param_count)
+                ctx->param_info[ins->data.param.index].needs_home = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    const CCValueType *param_types = ctx->fn->param_types;
+    const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
+
     for (size_t i = 0; i < param_count; ++i)
     {
-        offset += 8;
-        ctx->param_offsets[i] = -(int32_t)offset;
+        CCValueType type = param_types ? param_types[i] : CC_TYPE_I64;
+        bool needs_home = ctx->param_info[i].needs_home;
+
+        if (cc_value_type_is_float(type))
+            needs_home = true;
+
+        if (i >= abi->int_register_count)
+            needs_home = true;
+
+        bool register_available = false;
+        if (!cc_value_type_is_float(type) && i < abi->int_register_count)
+        {
+            switch (type)
+            {
+            case CC_TYPE_I1:
+            case CC_TYPE_I8:
+            case CC_TYPE_U8:
+                register_available = abi->reg8[i] != NULL;
+                break;
+            case CC_TYPE_I16:
+            case CC_TYPE_U16:
+                register_available = abi->reg16[i] != NULL;
+                break;
+            case CC_TYPE_I32:
+            case CC_TYPE_U32:
+                register_available = abi->reg32[i] != NULL;
+                break;
+            default:
+                register_available = abi->reg64[i] != NULL;
+                break;
+            }
+        }
+
+        if (!register_available)
+            needs_home = true;
+
+        if (load_counts[i] > 0)
+            needs_home = true;
+
+        ctx->param_info[i].needs_home = needs_home;
+        ctx->param_info[i].consumed = false;
+        if (needs_home)
+            ctx->home_param_stack_bytes += 8;
     }
-    ctx->param_count = param_count;
+
+    free(load_counts);
+    return true;
+}
+
+static bool ensure_param_offsets(X86FunctionContext *ctx)
+{
+    if (ctx->param_count == 0)
+    {
+        ctx->param_offsets = NULL;
+        return true;
+    }
+
+    ctx->param_offsets = (int32_t *)malloc(sizeof(int32_t) * ctx->param_count);
+    if (!ctx->param_offsets)
+        return false;
+
+    size_t offset = 0;
+    for (size_t i = 0; i < ctx->param_count; ++i)
+    {
+        if (ctx->param_info && ctx->param_info[i].needs_home)
+        {
+            offset += 8;
+            ctx->param_offsets[i] = -(int32_t)offset;
+        }
+        else
+        {
+            ctx->param_offsets[i] = INT32_MIN;
+        }
+    }
+
+    ctx->home_param_stack_bytes = offset;
     return true;
 }
 
@@ -649,17 +771,20 @@ static bool x86_vararg_base_offset(const X86FunctionContext *ctx, size_t *out_of
 static bool ensure_local_offsets(X86FunctionContext *ctx)
 {
     size_t local_count = ctx->fn->local_count;
+    size_t offset = ctx->home_param_stack_bytes;
+
     if (local_count == 0)
     {
         ctx->local_offsets = NULL;
         ctx->local_count = 0;
-        ctx->frame_size = align_to(ctx->param_count * 8, X86_STACK_ALIGNMENT);
+        ctx->frame_size = align_to(offset, X86_STACK_ALIGNMENT);
         return true;
     }
+
     ctx->local_offsets = (int32_t *)malloc(sizeof(int32_t) * local_count);
     if (!ctx->local_offsets)
         return false;
-    size_t offset = ctx->param_count * 8;
+
     for (size_t i = 0; i < local_count; ++i)
     {
         size_t slot_size = cc_value_type_size(ctx->fn->local_types ? ctx->fn->local_types[i] : CC_TYPE_I64);
@@ -669,6 +794,7 @@ static bool ensure_local_offsets(X86FunctionContext *ctx)
         offset += slot_size;
         ctx->local_offsets[i] = -(int32_t)offset;
     }
+
     ctx->local_count = local_count;
     ctx->frame_size = align_to(offset, X86_STACK_ALIGNMENT);
     return true;
@@ -680,9 +806,11 @@ static void function_context_free(X86FunctionContext *ctx)
         return;
     free(ctx->stack);
     free(ctx->param_offsets);
+    free(ctx->param_info);
     free(ctx->local_offsets);
     ctx->stack = NULL;
     ctx->param_offsets = NULL;
+    ctx->param_info = NULL;
     ctx->local_offsets = NULL;
     ctx->stack_capacity = 0;
     ctx->stack_size = 0;
@@ -857,6 +985,59 @@ static bool emit_pop_to_rax(FILE *out, X86FunctionContext *ctx, StackValue *valu
     return true;
 }
 
+static bool x86_materialize_popped_value(X86FunctionContext *ctx, const StackValue *value, const char *reg)
+{
+    if (!ctx || !value || !reg)
+        return false;
+
+    switch (value->location)
+    {
+    case STACK_LOC_STACK:
+        fprintf(ctx->out, "    pop %s\n", reg);
+        break;
+    case STACK_LOC_RAX:
+        if (strcmp(reg, "rax") != 0)
+            fprintf(ctx->out, "    mov %s, rax\n", reg);
+        break;
+    case STACK_LOC_R10:
+        if (strcmp(reg, "r10") != 0)
+            fprintf(ctx->out, "    mov %s, r10\n", reg);
+        ctx->reg_r10_in_use = false;
+        break;
+    case STACK_LOC_R11:
+        if (strcmp(reg, "r11") != 0)
+            fprintf(ctx->out, "    mov %s, r11\n", reg);
+        ctx->reg_r11_in_use = false;
+        break;
+    case STACK_LOC_NONE:
+        if (strcmp(reg, "rax") != 0)
+            fprintf(ctx->out, "    mov %s, rax\n", reg);
+        break;
+    }
+    return true;
+}
+
+static void x86_discard_popped_value(X86FunctionContext *ctx, const StackValue *value)
+{
+    if (!ctx || !value)
+        return;
+
+    switch (value->location)
+    {
+    case STACK_LOC_STACK:
+        fprintf(ctx->out, "    add rsp, 8\n");
+        break;
+    case STACK_LOC_R10:
+        ctx->reg_r10_in_use = false;
+        break;
+    case STACK_LOC_R11:
+        ctx->reg_r11_in_use = false;
+        break;
+    default:
+        break;
+    }
+}
+
 static bool emit_push_rax(FILE *out, X86FunctionContext *ctx, CCValueType type, bool is_unsigned)
 {
     (void)out;
@@ -868,6 +1049,8 @@ static bool emit_push_rax(FILE *out, X86FunctionContext *ctx, CCValueType type, 
     slot->type = type;
     slot->is_unsigned = is_unsigned;
     slot->location = STACK_LOC_RAX;
+    slot->is_constant = false;
+    slot->constant_u64 = 0;
     return true;
 }
 
@@ -938,6 +1121,9 @@ static bool emit_load_const(X86FunctionContext *ctx, const CCInstruction *ins)
     bool is_unsigned = ins->data.constant.is_unsigned;
     x86_ensure_rax_available(ctx);
 
+    bool mark_constant = false;
+    uint64_t constant_bits = 0;
+
     if (type == CC_TYPE_F32)
     {
         union
@@ -947,9 +1133,8 @@ static bool emit_load_const(X86FunctionContext *ctx, const CCInstruction *ins)
         } bits;
         bits.f = ins->data.constant.value.f32;
         fprintf(ctx->out, "    mov eax, 0x%08x\n", bits.u);
-        return emit_push_rax(ctx->out, ctx, type, false);
     }
-    if (type == CC_TYPE_F64)
+    else if (type == CC_TYPE_F64)
     {
         union
         {
@@ -958,22 +1143,51 @@ static bool emit_load_const(X86FunctionContext *ctx, const CCInstruction *ins)
         } bits;
         bits.d = ins->data.constant.value.f64;
         fprintf(ctx->out, "    mov rax, 0x%016llx\n", (unsigned long long)bits.u);
-        return emit_push_rax(ctx->out, ctx, type, false);
     }
-
-    if (type == CC_TYPE_PTR && ins->data.constant.is_null)
+    else if (type == CC_TYPE_PTR && ins->data.constant.is_null)
     {
         fprintf(ctx->out, "    xor rax, rax\n");
+        mark_constant = true;
+        constant_bits = 0;
     }
     else if (is_unsigned)
     {
         fprintf(ctx->out, "    mov rax, 0x%llx\n", (unsigned long long)ins->data.constant.value.u64);
+        mark_constant = true;
+        constant_bits = ins->data.constant.value.u64;
     }
     else
     {
         fprintf(ctx->out, "    mov rax, %lld\n", (long long)ins->data.constant.value.i64);
+        mark_constant = true;
+        constant_bits = (uint64_t)ins->data.constant.value.i64;
     }
-    return emit_push_rax(ctx->out, ctx, type, is_unsigned);
+
+    if (!emit_push_rax(ctx->out, ctx, type, is_unsigned))
+        return false;
+
+    StackValue *slot = function_stack_peek(ctx, 0);
+    if (slot)
+    {
+        if (mark_constant && !cc_value_type_is_float(type))
+        {
+            size_t bit_width = cc_value_type_size(type) * 8;
+            if (bit_width > 0 && bit_width < 64)
+            {
+                uint64_t mask = ((uint64_t)1 << bit_width) - 1;
+                constant_bits &= mask;
+            }
+            slot->is_constant = true;
+            slot->constant_u64 = constant_bits;
+        }
+        else
+        {
+            slot->is_constant = false;
+            slot->constant_u64 = 0;
+        }
+    }
+
+    return true;
 }
 
 static bool emit_load_local(X86FunctionContext *ctx, const CCInstruction *ins)
@@ -1065,11 +1279,83 @@ static bool emit_load_param(X86FunctionContext *ctx, const CCInstruction *ins)
         emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "load_param index %u out of range", index);
         return false;
     }
-    bool is_unsigned = !cc_value_type_is_signed(ins->data.param.type);
-    x86_ensure_rax_available(ctx);
-    if (!emit_load_into_rax_from_rbp(ctx, ins->line, ctx->param_offsets[index], ins->data.param.type, is_unsigned))
-        return false;
-    return emit_push_rax(ctx->out, ctx, ins->data.param.type, is_unsigned);
+    CCValueType type = ins->data.param.type;
+    bool is_unsigned = !cc_value_type_is_signed(type);
+
+    X86ParamInfo *info = (ctx->param_info && index < ctx->param_count) ? &ctx->param_info[index] : NULL;
+    bool loaded_from_register = false;
+
+    if (info && !info->needs_home && !info->consumed && ctx->abi && index < ctx->abi->int_register_count && !cc_value_type_is_float(type))
+    {
+        const X86ABIInfo *abi = ctx->abi;
+        const char *reg_name = NULL;
+        switch (type)
+        {
+        case CC_TYPE_I1:
+        case CC_TYPE_U8:
+        case CC_TYPE_I8:
+            reg_name = abi->reg8[index];
+            break;
+        case CC_TYPE_I16:
+        case CC_TYPE_U16:
+            reg_name = abi->reg16[index];
+            break;
+        case CC_TYPE_I32:
+        case CC_TYPE_U32:
+            reg_name = abi->reg32[index];
+            break;
+        default:
+            reg_name = abi->reg64[index];
+            break;
+        }
+
+        if (reg_name)
+        {
+            x86_ensure_rax_available(ctx);
+            switch (type)
+            {
+            case CC_TYPE_I1:
+            case CC_TYPE_U8:
+                fprintf(ctx->out, "    movzx eax, %s\n", reg_name);
+                break;
+            case CC_TYPE_I8:
+                fprintf(ctx->out, "    movsx eax, %s\n", reg_name);
+                break;
+            case CC_TYPE_I16:
+                fprintf(ctx->out, "    movsx eax, %s\n", reg_name);
+                break;
+            case CC_TYPE_U16:
+                fprintf(ctx->out, "    movzx eax, %s\n", reg_name);
+                break;
+            case CC_TYPE_I32:
+                fprintf(ctx->out, "    movsxd rax, %s\n", reg_name);
+                break;
+            case CC_TYPE_U32:
+                fprintf(ctx->out, "    mov eax, %s\n", reg_name);
+                break;
+            default:
+                fprintf(ctx->out, "    mov rax, %s\n", reg_name);
+                break;
+            }
+            info->consumed = true;
+            loaded_from_register = true;
+        }
+    }
+
+    if (!loaded_from_register)
+    {
+        int32_t offset = ctx->param_offsets ? ctx->param_offsets[index] : INT32_MIN;
+        if (offset == INT32_MIN)
+        {
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "load_param %u has no home slot", index);
+            return false;
+        }
+        x86_ensure_rax_available(ctx);
+        if (!emit_load_into_rax_from_rbp(ctx, ins->line, offset, type, is_unsigned))
+            return false;
+    }
+
+    return emit_push_rax(ctx->out, ctx, type, is_unsigned);
 }
 
 static bool emit_addr_param(X86FunctionContext *ctx, const CCInstruction *ins)
@@ -1095,7 +1381,13 @@ static bool emit_addr_param(X86FunctionContext *ctx, const CCInstruction *ins)
         return false;
     }
     x86_ensure_rax_available(ctx);
-    fprintf(ctx->out, "    lea rax, [rbp%+d]\n", ctx->param_offsets[index]);
+    int32_t offset = ctx->param_offsets ? ctx->param_offsets[index] : INT32_MIN;
+    if (offset == INT32_MIN)
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "addr_param %u has no home slot", index);
+        return false;
+    }
+    fprintf(ctx->out, "    lea rax, [rbp%+d]\n", offset);
     return emit_push_rax(ctx->out, ctx, CC_TYPE_PTR, true);
 }
 
@@ -1446,13 +1738,37 @@ static bool emit_compare(X86FunctionContext *ctx, const CCInstruction *ins)
     }
 
     StackValue rhs;
-    StackValue lhs;
-    if (!emit_pop_to(ctx->out, ctx, "rbx", &rhs) || !emit_pop_to_rax(ctx->out, ctx, &lhs))
+    if (!function_stack_pop(ctx, &rhs))
     {
-        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "compare requires two operands");
+        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "compare requires RHS operand");
         return false;
     }
-    fprintf(ctx->out, "    cmp rax, rbx\n");
+
+    bool rhs_is_zero = rhs.is_constant && rhs.constant_u64 == 0;
+    if (!rhs_is_zero)
+    {
+        if (!x86_materialize_popped_value(ctx, &rhs, "rbx"))
+        {
+            emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "failed to materialize compare RHS");
+            return false;
+        }
+    }
+    else
+    {
+        x86_discard_popped_value(ctx, &rhs);
+    }
+
+    StackValue lhs;
+    if (!emit_pop_to_rax(ctx->out, ctx, &lhs))
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "compare requires LHS operand");
+        return false;
+    }
+
+    if (rhs_is_zero)
+        fprintf(ctx->out, "    cmp rax, 0\n");
+    else
+        fprintf(ctx->out, "    cmp rax, rbx\n");
     bool is_unsigned = ins->data.compare.is_unsigned || !cc_value_type_is_signed(ins->data.compare.type);
     const char *set_instr = NULL;
     switch (ins->data.compare.op)
@@ -1856,10 +2172,9 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
         return true;
     }
 
-    if (call_frame_size > 0)
-        fprintf(ctx->out, "    add rsp, %zu\n", call_frame_size);
-    if (arg_count > 0)
-        fprintf(ctx->out, "    add rsp, %zu\n", arg_count * 8);
+    size_t stack_restore = call_frame_size + arg_count * 8;
+    if (stack_restore > 0)
+        fprintf(ctx->out, "    add rsp, %zu\n", stack_restore);
 
     if (ins->data.call.return_type != CC_TYPE_VOID)
     {
@@ -1988,8 +2303,12 @@ static void emit_function_prologue(X86FunctionContext *ctx)
 
     for (size_t i = 0; i < ctx->param_count; ++i)
     {
+        if (!ctx->param_info || !ctx->param_info[i].needs_home)
+            continue;
         CCValueType type = ctx->fn->param_types ? ctx->fn->param_types[i] : CC_TYPE_I64;
         int32_t offset = ctx->param_offsets[i];
+        if (offset == INT32_MIN)
+            continue;
         if (i < reg_count)
         {
             switch (type)
@@ -1997,19 +2316,23 @@ static void emit_function_prologue(X86FunctionContext *ctx)
             case CC_TYPE_I1:
             case CC_TYPE_U8:
             case CC_TYPE_I8:
-                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->byte_mem_keyword, offset, abi->reg8[i]);
+                if (abi->reg8[i])
+                    fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->byte_mem_keyword, offset, abi->reg8[i]);
                 break;
             case CC_TYPE_I16:
             case CC_TYPE_U16:
-                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->word_mem_keyword, offset, abi->reg16[i]);
+                if (abi->reg16[i])
+                    fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->word_mem_keyword, offset, abi->reg16[i]);
                 break;
             case CC_TYPE_I32:
             case CC_TYPE_U32:
             case CC_TYPE_F32:
-                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->dword_mem_keyword, offset, abi->reg32[i]);
+                if (abi->reg32[i])
+                    fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->dword_mem_keyword, offset, abi->reg32[i]);
                 break;
             default:
-                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->qword_mem_keyword, offset, abi->reg64[i]);
+                if (abi->reg64[i])
+                    fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->qword_mem_keyword, offset, abi->reg64[i]);
                 break;
             }
         }
@@ -2044,6 +2367,11 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
     ctx.syntax = module_ctx->syntax;
     ctx.abi = module_ctx->abi;
 
+    if (!analyze_param_usage(&ctx))
+    {
+        function_context_free(&ctx);
+        return false;
+    }
     if (!ensure_param_offsets(&ctx))
     {
         function_context_free(&ctx);
@@ -2055,23 +2383,30 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
         return false;
     }
 
-    ctx.use_frame = (ctx.frame_size > 0) || (ctx.param_count > 0);
-    if (fn->is_varargs)
-        ctx.use_frame = true;
+    ctx.use_frame = (ctx.frame_size > 0) || fn->is_varargs;
     if (!ctx.use_frame)
     {
         for (size_t i = 0; i < fn->instruction_count; ++i)
         {
             CCInstrKind kind = fn->instructions[i].kind;
             if (kind == CC_INSTR_STACK_ALLOC ||
-                kind == CC_INSTR_LOAD_PARAM ||
-                kind == CC_INSTR_ADDR_PARAM ||
                 kind == CC_INSTR_LOAD_LOCAL ||
                 kind == CC_INSTR_STORE_LOCAL ||
                 kind == CC_INSTR_ADDR_LOCAL)
             {
                 ctx.use_frame = true;
                 break;
+            }
+            if (!ctx.param_info)
+                continue;
+            if (kind == CC_INSTR_LOAD_PARAM || kind == CC_INSTR_ADDR_PARAM)
+            {
+                uint32_t index = fn->instructions[i].data.param.index;
+                if (index < ctx.param_count && ctx.param_info[index].needs_home)
+                {
+                    ctx.use_frame = true;
+                    break;
+                }
             }
         }
     }

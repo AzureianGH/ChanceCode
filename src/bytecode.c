@@ -529,6 +529,37 @@ static long long cc_sign_extend_bits(unsigned long long value, unsigned bits)
     return (long long)value;
 }
 
+static unsigned cc_value_type_bit_width(CCValueType type)
+{
+    size_t bytes = cc_value_type_size(type);
+    if (bytes == 0)
+        return 0;
+    return (unsigned)(bytes * 8);
+}
+
+static bool cc_constant_truthy(const CCInstruction *ins)
+{
+    if (!ins || ins->kind != CC_INSTR_CONST)
+        return false;
+
+    CCValueType type = ins->data.constant.type;
+    if (cc_value_type_is_float(type))
+    {
+        double value = (type == CC_TYPE_F32) ? (double)ins->data.constant.value.f32 : ins->data.constant.value.f64;
+        return value != 0.0;
+    }
+
+    if (type == CC_TYPE_PTR)
+        return !ins->data.constant.is_null && ins->data.constant.value.u64 != 0ULL;
+
+    unsigned bits = cc_value_type_bit_width(type);
+    if (bits == 0)
+        return ins->data.constant.value.u64 != 0ULL;
+
+    unsigned long long mask = cc_mask_for_bits(bits);
+    return (ins->data.constant.value.u64 & mask) != 0ULL;
+}
+
 static bool cc_instruction_is_pure(const CCInstruction *ins)
 {
     if (!ins)
@@ -574,11 +605,12 @@ static void cc_function_remove_instructions(CCFunction *fn, size_t index, size_t
         memset(&fn->instructions[i], 0, sizeof(CCInstruction));
 }
 
-static void cc_function_prune_dropped_values(CCFunction *fn)
+static bool cc_function_prune_dropped_values(CCFunction *fn)
 {
     if (!fn)
-        return;
+        return false;
 
+    bool changed = false;
     size_t i = 0;
     while (i < fn->instruction_count)
     {
@@ -603,6 +635,7 @@ static void cc_function_prune_dropped_values(CCFunction *fn)
         {
             size_t remove_count = i - remove_start + 1;
             cc_function_remove_instructions(fn, remove_start, remove_count);
+            changed = true;
             if (remove_start > 0)
                 i = remove_start - 1;
             else
@@ -613,13 +646,15 @@ static void cc_function_prune_dropped_values(CCFunction *fn)
             ++i;
         }
     }
+    return changed;
 }
 
-static void cc_function_fold_const_binops(CCFunction *fn)
+static bool cc_function_fold_const_binops(CCFunction *fn)
 {
     if (!fn)
-        return;
+        return false;
 
+    bool changed = false;
     size_t i = 0;
     while (i + 2 < fn->instruction_count)
     {
@@ -634,26 +669,79 @@ static void cc_function_fold_const_binops(CCFunction *fn)
         }
 
         CCValueType type = bin->data.binop.type;
-        if (!cc_value_type_is_integer(type))
-        {
-            ++i;
-            continue;
-        }
-
         if (lhs->data.constant.type != type || rhs->data.constant.type != type)
         {
             ++i;
             continue;
         }
 
-        size_t type_bytes = cc_value_type_size(type);
-        if (type_bytes == 0)
+        if (cc_value_type_is_float(type))
+        {
+            double lhs_val = (type == CC_TYPE_F32) ? (double)lhs->data.constant.value.f32 : lhs->data.constant.value.f64;
+            double rhs_val = (type == CC_TYPE_F32) ? (double)rhs->data.constant.value.f32 : rhs->data.constant.value.f64;
+            double result = 0.0;
+            bool handled_float = true;
+
+            switch (bin->data.binop.op)
+            {
+            case CC_BINOP_ADD:
+                result = lhs_val + rhs_val;
+                break;
+            case CC_BINOP_SUB:
+                result = lhs_val - rhs_val;
+                break;
+            case CC_BINOP_MUL:
+                result = lhs_val * rhs_val;
+                break;
+            case CC_BINOP_DIV:
+                if (rhs_val == 0.0)
+                    handled_float = false;
+                else
+                    result = lhs_val / rhs_val;
+                break;
+            default:
+                handled_float = false;
+                break;
+            }
+
+            if (!handled_float)
+            {
+                ++i;
+                continue;
+            }
+
+            if (type == CC_TYPE_F32)
+            {
+                float reduced = (float)result;
+                lhs->data.constant.value.f32 = reduced;
+                lhs->data.constant.is_null = (reduced == 0.0f);
+            }
+            else
+            {
+                lhs->data.constant.value.f64 = result;
+                lhs->data.constant.is_null = (result == 0.0);
+            }
+            lhs->data.constant.type = type;
+            lhs->data.constant.is_unsigned = false;
+
+            cc_function_remove_instructions(fn, i + 1, 2);
+            changed = true;
+            continue;
+        }
+
+        if (!cc_value_type_is_integer(type))
         {
             ++i;
             continue;
         }
 
-        unsigned bits = (unsigned)(type_bytes * 8);
+        unsigned bits = cc_value_type_bit_width(type);
+        if (bits == 0)
+        {
+            ++i;
+            continue;
+        }
+
         unsigned long long mask = cc_mask_for_bits(bits);
         unsigned long long lhs_u = lhs->data.constant.value.u64 & mask;
         unsigned long long rhs_u = rhs->data.constant.value.u64 & mask;
@@ -667,56 +755,33 @@ static void cc_function_fold_const_binops(CCFunction *fn)
         switch (bin->data.binop.op)
         {
         case CC_BINOP_ADD:
-            if (use_unsigned)
-                result_u = lhs_u + rhs_u;
-            else
-                result_u = (unsigned long long)(lhs_s + rhs_s);
+            result_u = use_unsigned ? (lhs_u + rhs_u) : (unsigned long long)(lhs_s + rhs_s);
             break;
         case CC_BINOP_SUB:
-            if (use_unsigned)
-                result_u = lhs_u - rhs_u;
-            else
-                result_u = (unsigned long long)(lhs_s - rhs_s);
+            result_u = use_unsigned ? (lhs_u - rhs_u) : (unsigned long long)(lhs_s - rhs_s);
             break;
         case CC_BINOP_MUL:
-            if (use_unsigned)
-                result_u = lhs_u * rhs_u;
-            else
-                result_u = (unsigned long long)(lhs_s * rhs_s);
+            result_u = use_unsigned ? (lhs_u * rhs_u) : (unsigned long long)(lhs_s * rhs_s);
             break;
         case CC_BINOP_DIV:
             if (rhs_u == 0)
-            {
                 handled = false;
-            }
             else if (use_unsigned)
-            {
                 result_u = lhs_u / rhs_u;
-            }
+            else if (rhs_s != 0)
+                result_u = (unsigned long long)(lhs_s / rhs_s);
             else
-            {
-                if (rhs_s == 0)
-                    handled = false;
-                else
-                    result_u = (unsigned long long)(lhs_s / rhs_s);
-            }
+                handled = false;
             break;
         case CC_BINOP_MOD:
             if (rhs_u == 0)
-            {
                 handled = false;
-            }
             else if (use_unsigned)
-            {
                 result_u = lhs_u % rhs_u;
-            }
+            else if (rhs_s != 0)
+                result_u = (unsigned long long)(lhs_s % rhs_s);
             else
-            {
-                if (rhs_s == 0)
-                    handled = false;
-                else
-                    result_u = (unsigned long long)(lhs_s % rhs_s);
-            }
+                handled = false;
             break;
         case CC_BINOP_AND:
             result_u = lhs_u & rhs_u;
@@ -732,7 +797,7 @@ static void cc_function_fold_const_binops(CCFunction *fn)
             unsigned shift = (unsigned)(rhs_u & 63U);
             if (bits < 64)
                 shift %= bits;
-            result_u = (lhs_u << shift);
+            result_u = lhs_u << shift;
             break;
         }
         case CC_BINOP_SHR:
@@ -764,10 +829,612 @@ static void cc_function_fold_const_binops(CCFunction *fn)
         lhs->data.constant.value.i64 = result_s;
         lhs->data.constant.type = type;
         lhs->data.constant.is_unsigned = use_unsigned;
-        lhs->data.constant.is_null = (result_u == 0);
+        lhs->data.constant.is_null = (result_u == 0ULL);
 
         cc_function_remove_instructions(fn, i + 1, 2);
+        changed = true;
     }
+
+    return changed;
+}
+
+static bool cc_function_fold_const_unops(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    size_t i = 0;
+    while (i + 1 < fn->instruction_count)
+    {
+        CCInstruction *operand = &fn->instructions[i];
+        CCInstruction *unop = &fn->instructions[i + 1];
+
+        if (operand->kind != CC_INSTR_CONST || unop->kind != CC_INSTR_UNOP)
+        {
+            ++i;
+            continue;
+        }
+
+        CCValueType type = unop->data.unop.type;
+        if (operand->data.constant.type != type)
+        {
+            ++i;
+            continue;
+        }
+
+        bool handled = true;
+        switch (unop->data.unop.op)
+        {
+        case CC_UNOP_NEG:
+            if (!cc_value_type_is_integer(type))
+            {
+                handled = false;
+                break;
+            }
+            else
+            {
+                unsigned bits = cc_value_type_bit_width(type);
+                if (bits == 0)
+                {
+                    handled = false;
+                    break;
+                }
+                unsigned long long mask = cc_mask_for_bits(bits);
+                unsigned long long value_u = operand->data.constant.value.u64 & mask;
+                long long value_s = cc_sign_extend_bits(value_u, bits);
+                long long negated = -value_s;
+                unsigned long long neg_u = (unsigned long long)negated;
+                if (bits < 64)
+                    neg_u &= mask;
+                operand->data.constant.value.u64 = neg_u;
+                operand->data.constant.value.i64 = cc_sign_extend_bits(neg_u, bits);
+                operand->data.constant.is_unsigned = !cc_value_type_is_signed(type);
+                operand->data.constant.is_null = (neg_u == 0ULL);
+            }
+            break;
+        case CC_UNOP_NOT:
+        {
+            bool truthy = cc_constant_truthy(operand);
+            operand->data.constant.type = CC_TYPE_I1;
+            operand->data.constant.value.u64 = truthy ? 0ULL : 1ULL;
+            operand->data.constant.value.i64 = truthy ? 0LL : 1LL;
+            operand->data.constant.is_unsigned = true;
+            operand->data.constant.is_null = truthy;
+            break;
+        }
+        case CC_UNOP_BITNOT:
+            if (!cc_value_type_is_integer(type))
+            {
+                handled = false;
+                break;
+            }
+            else
+            {
+                unsigned bits = cc_value_type_bit_width(type);
+                if (bits == 0)
+                {
+                    handled = false;
+                    break;
+                }
+                unsigned long long mask = cc_mask_for_bits(bits);
+                unsigned long long value_u = operand->data.constant.value.u64 & mask;
+                unsigned long long inverted = (~value_u) & mask;
+                operand->data.constant.value.u64 = inverted;
+                operand->data.constant.value.i64 = cc_sign_extend_bits(inverted, bits);
+                operand->data.constant.is_unsigned = !cc_value_type_is_signed(type);
+                operand->data.constant.is_null = (inverted == 0ULL);
+            }
+            break;
+        default:
+            handled = false;
+            break;
+        }
+
+        if (!handled)
+        {
+            ++i;
+            continue;
+        }
+
+        if (unop->data.unop.op != CC_UNOP_NOT)
+            operand->data.constant.type = type;
+
+        cc_function_remove_instructions(fn, i + 1, 1);
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool cc_function_fold_const_compares(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    size_t i = 0;
+    while (i + 2 < fn->instruction_count)
+    {
+        CCInstruction *lhs = &fn->instructions[i];
+        CCInstruction *rhs = &fn->instructions[i + 1];
+        CCInstruction *cmp = &fn->instructions[i + 2];
+
+        if (lhs->kind != CC_INSTR_CONST || rhs->kind != CC_INSTR_CONST || cmp->kind != CC_INSTR_COMPARE)
+        {
+            ++i;
+            continue;
+        }
+
+        CCValueType operand_type = cmp->data.compare.type;
+        if (lhs->data.constant.type != operand_type || rhs->data.constant.type != operand_type)
+        {
+            ++i;
+            continue;
+        }
+
+        bool result = false;
+        bool handled = true;
+
+        if (cc_value_type_is_float(operand_type))
+        {
+            double lhs_val = (operand_type == CC_TYPE_F32) ? (double)lhs->data.constant.value.f32 : lhs->data.constant.value.f64;
+            double rhs_val = (operand_type == CC_TYPE_F32) ? (double)rhs->data.constant.value.f32 : rhs->data.constant.value.f64;
+
+            switch (cmp->data.compare.op)
+            {
+            case CC_COMPARE_EQ:
+                result = (lhs_val == rhs_val);
+                break;
+            case CC_COMPARE_NE:
+                result = (lhs_val != rhs_val);
+                break;
+            case CC_COMPARE_LT:
+                result = (lhs_val < rhs_val);
+                break;
+            case CC_COMPARE_LE:
+                result = (lhs_val <= rhs_val);
+                break;
+            case CC_COMPARE_GT:
+                result = (lhs_val > rhs_val);
+                break;
+            case CC_COMPARE_GE:
+                result = (lhs_val >= rhs_val);
+                break;
+            default:
+                handled = false;
+                break;
+            }
+        }
+        else if (cc_value_type_is_integer(operand_type) || operand_type == CC_TYPE_PTR)
+        {
+            unsigned bits = cc_value_type_bit_width(operand_type);
+            if (bits == 0)
+            {
+                ++i;
+                continue;
+            }
+
+            unsigned long long mask = cc_mask_for_bits(bits);
+            unsigned long long lhs_u = lhs->data.constant.value.u64 & mask;
+            unsigned long long rhs_u = rhs->data.constant.value.u64 & mask;
+            long long lhs_s = cc_sign_extend_bits(lhs_u, bits);
+            long long rhs_s = cc_sign_extend_bits(rhs_u, bits);
+            bool use_unsigned = cmp->data.compare.is_unsigned || operand_type == CC_TYPE_PTR || !cc_value_type_is_signed(operand_type);
+
+            switch (cmp->data.compare.op)
+            {
+            case CC_COMPARE_EQ:
+                result = use_unsigned ? (lhs_u == rhs_u) : (lhs_s == rhs_s);
+                break;
+            case CC_COMPARE_NE:
+                result = use_unsigned ? (lhs_u != rhs_u) : (lhs_s != rhs_s);
+                break;
+            case CC_COMPARE_LT:
+                result = use_unsigned ? (lhs_u < rhs_u) : (lhs_s < rhs_s);
+                break;
+            case CC_COMPARE_LE:
+                result = use_unsigned ? (lhs_u <= rhs_u) : (lhs_s <= rhs_s);
+                break;
+            case CC_COMPARE_GT:
+                result = use_unsigned ? (lhs_u > rhs_u) : (lhs_s > rhs_s);
+                break;
+            case CC_COMPARE_GE:
+                result = use_unsigned ? (lhs_u >= rhs_u) : (lhs_s >= rhs_s);
+                break;
+            default:
+                handled = false;
+                break;
+            }
+        }
+        else
+        {
+            handled = false;
+        }
+
+        if (!handled)
+        {
+            ++i;
+            continue;
+        }
+
+        lhs->data.constant.type = CC_TYPE_I1;
+        lhs->data.constant.value.u64 = result ? 1ULL : 0ULL;
+        lhs->data.constant.value.i64 = result ? 1LL : 0LL;
+        lhs->data.constant.is_unsigned = true;
+        lhs->data.constant.is_null = !result;
+
+        cc_function_remove_instructions(fn, i + 1, 2);
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool cc_function_fold_const_converts(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    size_t i = 0;
+    while (i + 1 < fn->instruction_count)
+    {
+        CCInstruction *source = &fn->instructions[i];
+        CCInstruction *conv = &fn->instructions[i + 1];
+
+        if (source->kind != CC_INSTR_CONST || conv->kind != CC_INSTR_CONVERT)
+        {
+            ++i;
+            continue;
+        }
+
+        CCValueType from = conv->data.convert.from_type;
+        CCValueType to = conv->data.convert.to_type;
+        if (source->data.constant.type != from)
+        {
+            ++i;
+            continue;
+        }
+
+        bool handled = false;
+        switch (conv->data.convert.kind)
+        {
+        case CC_CONVERT_TRUNC:
+            if (cc_value_type_is_integer(from) && cc_value_type_is_integer(to))
+            {
+                unsigned to_bits = cc_value_type_bit_width(to);
+                if (to_bits > 0)
+                {
+                    unsigned from_bits = cc_value_type_bit_width(from);
+                    unsigned long long value_u = source->data.constant.value.u64;
+                    if (from_bits > 0 && from_bits < 64)
+                        value_u &= cc_mask_for_bits(from_bits);
+                    unsigned long long mask = cc_mask_for_bits(to_bits);
+                    value_u &= mask;
+                    source->data.constant.value.u64 = value_u;
+                    source->data.constant.value.i64 = cc_sign_extend_bits(value_u, to_bits);
+                    source->data.constant.type = to;
+                    source->data.constant.is_unsigned = (to == CC_TYPE_PTR) || !cc_value_type_is_signed(to);
+                    source->data.constant.is_null = (value_u == 0ULL);
+                    handled = true;
+                }
+            }
+            break;
+        case CC_CONVERT_SEXT:
+            if (cc_value_type_is_integer(from) && cc_value_type_is_integer(to))
+            {
+                unsigned from_bits = cc_value_type_bit_width(from);
+                unsigned to_bits = cc_value_type_bit_width(to);
+                if (from_bits > 0 && to_bits >= from_bits)
+                {
+                    unsigned long long raw = source->data.constant.value.u64 & cc_mask_for_bits(from_bits);
+                    long long extended = cc_sign_extend_bits(raw, from_bits);
+                    unsigned long long result_u = (unsigned long long)extended;
+                    if (to_bits < 64)
+                        result_u &= cc_mask_for_bits(to_bits);
+                    source->data.constant.value.u64 = result_u;
+                    source->data.constant.value.i64 = cc_sign_extend_bits(result_u, to_bits);
+                    source->data.constant.type = to;
+                    source->data.constant.is_unsigned = false;
+                    source->data.constant.is_null = (result_u == 0ULL);
+                    handled = true;
+                }
+            }
+            break;
+        case CC_CONVERT_ZEXT:
+            if (cc_value_type_is_integer(from) && cc_value_type_is_integer(to))
+            {
+                unsigned from_bits = cc_value_type_bit_width(from);
+                unsigned to_bits = cc_value_type_bit_width(to);
+                if (from_bits > 0 && to_bits >= from_bits)
+                {
+                    unsigned long long raw = source->data.constant.value.u64 & cc_mask_for_bits(from_bits);
+                    if (to_bits < 64)
+                        raw &= cc_mask_for_bits(to_bits);
+                    source->data.constant.value.u64 = raw;
+                    source->data.constant.value.i64 = (long long)raw;
+                    source->data.constant.type = to;
+                    source->data.constant.is_unsigned = true;
+                    source->data.constant.is_null = (raw == 0ULL);
+                    handled = true;
+                }
+            }
+            break;
+        case CC_CONVERT_F2I:
+            if (cc_value_type_is_float(from) && cc_value_type_is_integer(to) && cc_value_type_is_signed(to))
+            {
+                double value = (from == CC_TYPE_F32) ? (double)source->data.constant.value.f32 : source->data.constant.value.f64;
+                long long truncated = (long long)value;
+                unsigned long long result_u = (unsigned long long)truncated;
+                unsigned bits = cc_value_type_bit_width(to);
+                if (bits > 0 && bits < 64)
+                {
+                    unsigned long long mask = cc_mask_for_bits(bits);
+                    result_u &= mask;
+                    truncated = cc_sign_extend_bits(result_u, bits);
+                }
+                source->data.constant.value.u64 = result_u;
+                source->data.constant.value.i64 = truncated;
+                source->data.constant.type = to;
+                source->data.constant.is_unsigned = false;
+                source->data.constant.is_null = (result_u == 0ULL);
+                handled = true;
+            }
+            break;
+        case CC_CONVERT_I2F:
+            if (cc_value_type_is_integer(from) && cc_value_type_is_float(to))
+            {
+                unsigned bits = cc_value_type_bit_width(from);
+                unsigned long long mask = (bits > 0 && bits < 64) ? cc_mask_for_bits(bits) : ~0ULL;
+                unsigned long long raw = source->data.constant.value.u64 & mask;
+                long long signed_val = cc_sign_extend_bits(raw, bits);
+                double value = cc_value_type_is_signed(from) ? (double)signed_val : (double)raw;
+                if (to == CC_TYPE_F32)
+                {
+                    float fval = (float)value;
+                    source->data.constant.value.f32 = fval;
+                    source->data.constant.is_null = (fval == 0.0f);
+                }
+                else
+                {
+                    double dval = value;
+                    source->data.constant.value.f64 = dval;
+                    source->data.constant.is_null = (dval == 0.0);
+                }
+                source->data.constant.type = to;
+                source->data.constant.is_unsigned = false;
+                handled = true;
+            }
+            break;
+        case CC_CONVERT_BITCAST:
+            if (from == to)
+                handled = true;
+            break;
+        default:
+            break;
+        }
+
+        if (!handled)
+        {
+            ++i;
+            continue;
+        }
+
+        cc_function_remove_instructions(fn, i + 1, 1);
+        changed = true;
+    }
+
+    return changed;
+}
+
+static bool cc_function_local_used_after(const CCFunction *fn, size_t start_index, uint32_t local_index)
+{
+    if (!fn)
+        return false;
+    for (size_t j = start_index; j < fn->instruction_count; ++j)
+    {
+        const CCInstruction *ins = &fn->instructions[j];
+        switch (ins->kind)
+        {
+        case CC_INSTR_LOAD_LOCAL:
+        case CC_INSTR_STORE_LOCAL:
+        case CC_INSTR_ADDR_LOCAL:
+            if (ins->data.local.index == local_index)
+                return true;
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+static bool cc_function_elide_store_load_pairs(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    size_t i = 0;
+    while (i + 1 < fn->instruction_count)
+    {
+        CCInstruction *store = &fn->instructions[i];
+        CCInstruction *load = &fn->instructions[i + 1];
+
+        if (store->kind == CC_INSTR_STORE_LOCAL &&
+            load->kind == CC_INSTR_LOAD_LOCAL &&
+            store->data.local.index == load->data.local.index &&
+            store->data.local.type == load->data.local.type)
+        {
+            uint32_t idx = store->data.local.index;
+            if (!cc_function_local_used_after(fn, i + 2, idx))
+            {
+                cc_function_remove_instructions(fn, i, 2);
+                changed = true;
+                if (i > 0)
+                    --i;
+                continue;
+            }
+        }
+
+        ++i;
+    }
+
+    return changed;
+}
+
+static bool cc_function_remove_unused_locals(CCFunction *fn)
+{
+    if (!fn || fn->local_count == 0)
+        return false;
+
+    size_t local_count = fn->local_count;
+    bool *used = (bool *)calloc(local_count, sizeof(bool));
+    if (!used)
+        return false;
+
+    for (size_t i = 0; i < fn->instruction_count; ++i)
+    {
+        const CCInstruction *ins = &fn->instructions[i];
+        switch (ins->kind)
+        {
+        case CC_INSTR_LOAD_LOCAL:
+        case CC_INSTR_STORE_LOCAL:
+        case CC_INSTR_ADDR_LOCAL:
+            if (ins->data.local.index < local_count)
+                used[ins->data.local.index] = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    size_t new_count = 0;
+    for (size_t i = 0; i < local_count; ++i)
+    {
+        if (used[i])
+            ++new_count;
+    }
+
+    if (new_count == local_count)
+    {
+        free(used);
+        return false;
+    }
+
+    size_t *map = (size_t *)malloc(local_count * sizeof(size_t));
+    if (!map)
+    {
+        free(used);
+        return false;
+    }
+
+    size_t next = 0;
+    for (size_t i = 0; i < local_count; ++i)
+    {
+        if (used[i])
+            map[i] = next++;
+        else
+            map[i] = SIZE_MAX;
+    }
+
+    for (size_t i = 0; i < fn->instruction_count; ++i)
+    {
+        CCInstruction *ins = &fn->instructions[i];
+        switch (ins->kind)
+        {
+        case CC_INSTR_LOAD_LOCAL:
+        case CC_INSTR_STORE_LOCAL:
+        case CC_INSTR_ADDR_LOCAL:
+        {
+            uint32_t idx = ins->data.local.index;
+            if (idx < local_count && map[idx] != SIZE_MAX)
+                ins->data.local.index = (uint32_t)map[idx];
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    CCValueType *new_types = NULL;
+    if (new_count > 0)
+    {
+        new_types = (CCValueType *)malloc(new_count * sizeof(CCValueType));
+        if (!new_types)
+        {
+            free(map);
+            free(used);
+            return false;
+        }
+
+        for (size_t i = 0; i < local_count; ++i)
+        {
+            if (used[i])
+            {
+                size_t new_index = map[i];
+                new_types[new_index] = fn->local_types ? fn->local_types[i] : CC_TYPE_I64;
+            }
+        }
+    }
+
+    free(fn->local_types);
+    fn->local_types = new_types;
+    fn->local_count = new_count;
+
+    free(map);
+    free(used);
+    return true;
+}
+
+static bool cc_function_simplify_const_branches(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    size_t i = 0;
+    while (i + 1 < fn->instruction_count)
+    {
+        CCInstruction *cond = &fn->instructions[i];
+        CCInstruction *branch = &fn->instructions[i + 1];
+
+        if (cond->kind != CC_INSTR_CONST || branch->kind != CC_INSTR_BRANCH)
+        {
+            ++i;
+            continue;
+        }
+
+        if (cc_value_type_is_float(cond->data.constant.type))
+        {
+            ++i;
+            continue;
+        }
+
+        bool truthy = cc_constant_truthy(cond);
+        char *true_target = branch->data.branch.true_target;
+        char *false_target = branch->data.branch.false_target;
+        char *dest = truthy ? true_target : false_target;
+        char *discard = truthy ? false_target : true_target;
+
+        if (!dest)
+        {
+            ++i;
+            continue;
+        }
+
+        if (discard && discard != dest)
+            free(discard);
+
+        branch->kind = CC_INSTR_JUMP;
+        branch->data.jump.target = dest;
+
+        cc_function_remove_instructions(fn, i, 1);
+        changed = true;
+    }
+
+    return changed;
 }
 
 void cc_module_optimize(CCModule *module, int opt_level)
@@ -781,11 +1448,34 @@ void cc_module_optimize(CCModule *module, int opt_level)
         if (!fn || fn->instruction_count == 0)
             continue;
 
-        cc_function_prune_dropped_values(fn);
-        if (opt_level >= 2)
+        bool progress = true;
+        while (progress)
         {
-            cc_function_fold_const_binops(fn);
-            cc_function_prune_dropped_values(fn);
+            progress = false;
+            if (cc_function_prune_dropped_values(fn))
+                progress = true;
+            if (opt_level >= 2)
+            {
+                if (cc_function_fold_const_binops(fn))
+                    progress = true;
+                if (cc_function_fold_const_unops(fn))
+                    progress = true;
+                if (cc_function_fold_const_converts(fn))
+                    progress = true;
+                if (cc_function_fold_const_compares(fn))
+                    progress = true;
+                if (cc_function_simplify_const_branches(fn))
+                    progress = true;
+                if (cc_function_prune_dropped_values(fn))
+                    progress = true;
+            }
+            if (opt_level >= 3)
+            {
+                if (cc_function_elide_store_load_pairs(fn))
+                    progress = true;
+                if (cc_function_remove_unused_locals(fn))
+                    progress = true;
+            }
         }
     }
 }

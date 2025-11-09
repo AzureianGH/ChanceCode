@@ -11,7 +11,7 @@ void cc_register_builtin_backends(void);
 
 static void print_usage(void)
 {
-    fprintf(stderr, "Usage: ccb <input.ccb> [-O0|-O1|-O2] [--backend NAME] [--output PATH] [--option key=value] [--list-backends] [--emit-ccbin PATH]\n");
+    fprintf(stderr, "Usage: ccb <input.ccb> [-O0|-O1|-O2|-O3] [--backend NAME] [--output PATH] [--option key=value] [--list-backends] [--emit-ccbin PATH]\n");
 }
 
 static bool parse_option_assignment(const char *arg, CCBackendOption *out_option)
@@ -118,7 +118,7 @@ int main(int argc, char **argv)
             {
                 if (i + 1 >= argc)
                 {
-                    fprintf(stderr, "error: -O expects a level (0,1,2)\n");
+                    fprintf(stderr, "error: -O expects a level (0,1,2,3)\n");
                     return 1;
                 }
                 level_str = argv[++i];
@@ -131,13 +131,13 @@ int main(int argc, char **argv)
             }
             if (!valid_digits)
             {
-                fprintf(stderr, "error: invalid optimization level '%s' (use -O0|-O1|-O2)\n", level_str);
+                fprintf(stderr, "error: invalid optimization level '%s' (use -O0|-O1|-O2|-O3)\n", level_str);
                 return 1;
             }
             int level = atoi(level_str);
-            if (level < 0 || level > 2)
+            if (level < 0 || level > 3)
             {
-                fprintf(stderr, "error: invalid optimization level '%s' (use -O0|-O1|-O2)\n", level_str);
+                fprintf(stderr, "error: invalid optimization level '%s' (use -O0|-O1|-O2|-O3)\n", level_str);
                 return 1;
             }
             opt_level = level;
