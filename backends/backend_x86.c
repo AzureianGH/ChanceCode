@@ -2288,10 +2288,14 @@ static bool emit_ret(X86FunctionContext *ctx, const CCInstruction *ins)
 
 static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
 {
-    if (ctx->terminated)
+    if (ctx->terminated && ins->kind != CC_INSTR_LABEL)
     {
         return true;
     }
+
+    if (ins->kind == CC_INSTR_LABEL)
+        ctx->terminated = false;
+
     switch (ins->kind)
     {
     case CC_INSTR_CONST:
@@ -2519,7 +2523,7 @@ static void emit_global_data(const X86ModuleContext *ctx, const CCGlobal *global
     fprintf(out, "%s\n", section);
     fprintf(out, "%s %zu\n", ctx->syntax->align_directive, global->alignment ? global->alignment : cc_value_type_size(global->type));
     fprintf(out, "%s:\n", global->name);
-    size_t size = cc_value_type_size(global->type);
+    size_t size = global->size ? global->size : cc_value_type_size(global->type);
     if (size == 0)
         size = 8;
 

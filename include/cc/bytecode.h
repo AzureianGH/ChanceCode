@@ -134,6 +134,7 @@ extern "C"
     {
         char *name;
         CCValueType type;
+        size_t size;
         bool is_const;
         size_t alignment;
         CCGlobalInit init;

@@ -1648,8 +1648,7 @@ static bool parse_global(LoaderState *st, char *line)
                 while (*end && !isspace((unsigned char)*end))
                     ++end;
                 char saved = *end;
-                if (*end)
-                    *((char *)end) = '\0';
+                *((char *)end) = '\0';
 
                 if (strcmp(value, "null") == 0)
                 {
@@ -1663,8 +1662,7 @@ static bool parse_global(LoaderState *st, char *line)
                     if (!parse_uint64_token(value, &num))
                     {
                         loader_diag(st, CC_DIAG_ERROR, st->line, "invalid initializer '%s'", value);
-                        if (*end)
-                            *((char *)end) = saved;
+                        *((char *)end) = saved;
                         return false;
                     }
                     reset_global_init(&global->init);
@@ -1672,8 +1670,7 @@ static bool parse_global(LoaderState *st, char *line)
                     global->init.payload.u64 = num;
                 }
 
-                if (*end)
-                    *((char *)end) = saved;
+                *((char *)end) = saved;
                 cursor = (char *)end;
                 continue;
             }
@@ -1683,8 +1680,7 @@ static bool parse_global(LoaderState *st, char *line)
         while (*end && !isspace((unsigned char)*end))
             ++end;
         char saved = *end;
-        if (*end)
-            *((char *)end) = '\0';
+        *((char *)end) = '\0';
 
         if (strncmp(cursor, "type=", 5) == 0)
         {
@@ -1692,11 +1688,21 @@ static bool parse_global(LoaderState *st, char *line)
             if (ty == CC_TYPE_INVALID)
             {
                 loader_diag(st, CC_DIAG_ERROR, st->line, "invalid global type '%s'", cursor + 5);
-                if (*end)
-                    *((char *)end) = saved;
+                *((char *)end) = saved;
                 return false;
             }
             global->type = ty;
+        }
+        else if (strncmp(cursor, "size=", 5) == 0)
+        {
+            uint64_t value = 0;
+            if (!parse_uint64_token(cursor + 5, &value))
+            {
+                loader_diag(st, CC_DIAG_ERROR, st->line, "invalid size '%s'", cursor + 5);
+                *((char *)end) = saved;
+                return false;
+            }
+            global->size = (size_t)value;
         }
         else if (strncmp(cursor, "align=", 6) == 0)
         {
@@ -1704,8 +1710,7 @@ static bool parse_global(LoaderState *st, char *line)
             if (!parse_uint32_token(cursor + 6, &align))
             {
                 loader_diag(st, CC_DIAG_ERROR, st->line, "invalid alignment '%s'", cursor + 6);
-                if (*end)
-                    *((char *)end) = saved;
+                *((char *)end) = saved;
                 return false;
             }
             global->alignment = align;
@@ -1719,8 +1724,7 @@ static bool parse_global(LoaderState *st, char *line)
             loader_diag(st, CC_DIAG_WARNING, st->line, "unknown global attribute '%s'", cursor);
         }
 
-        if (*end)
-            *((char *)end) = saved;
+        *((char *)end) = saved;
         cursor = (char *)end;
     }
 
@@ -1729,6 +1733,9 @@ static bool parse_global(LoaderState *st, char *line)
         loader_diag(st, CC_DIAG_ERROR, st->line, "global '%s' missing type= attribute", global->name);
         return false;
     }
+
+    if (global->size == 0)
+        global->size = cc_value_type_size(global->type);
 
     if (global->alignment == 0)
         global->alignment = cc_value_type_size(global->type);

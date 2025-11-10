@@ -280,6 +280,7 @@ CCGlobal *cc_module_add_global(CCModule *module, const char *name)
     memset(global, 0, sizeof(*global));
     global->name = cc_strdup(name);
     global->type = CC_TYPE_INVALID;
+    global->size = 0;
     global->alignment = 0;
     global->is_const = false;
     global->init.kind = CC_GLOBAL_INIT_NONE;
