@@ -169,12 +169,27 @@ static size_t arm64_compute_max_stack_depth(const CCFunction *fn)
 		case CC_INSTR_CONST_STRING:
 		case CC_INSTR_LOAD_PARAM:
 		case CC_INSTR_LOAD_LOCAL:
+		case CC_INSTR_ADDR_PARAM:
+		case CC_INSTR_ADDR_LOCAL:
+		case CC_INSTR_ADDR_GLOBAL:
+		case CC_INSTR_LOAD_GLOBAL:
+		case CC_INSTR_LOAD_INDIRECT:
 			depth++;
 			break;
 		case CC_INSTR_STORE_LOCAL:
 		case CC_INSTR_DROP:
 			if (depth > 0)
 				depth--;
+			break;
+		case CC_INSTR_STORE_GLOBAL:
+			if (depth > 0)
+				depth--;
+			break;
+		case CC_INSTR_STORE_INDIRECT:
+			if (depth >= 2)
+				depth -= 2;
+			else
+				depth = 0;
 			break;
 		case CC_INSTR_BINOP:
 			if (depth >= 2)
@@ -422,6 +437,19 @@ static const char *symbol_with_underscore(const char *name, char *buffer, size_t
 		return NULL;
 	snprintf(buffer, buffer_size, "_%s", name);
 	return buffer;
+}
+
+static bool arm64_emit_stack_address(FILE *out, CCDiagnosticSink *sink, size_t line, const char *dst_reg, size_t offset)
+{
+	if (!out || !dst_reg)
+		return false;
+	if (offset > 4095)
+	{
+		emit_diag(sink, CC_DIAG_ERROR, line, "arm64 backend does not yet support stack offsets larger than 4095 bytes (got %zu)", offset);
+		return false;
+	}
+	fprintf(out, "    add %s, sp, #%zu\n", dst_reg, offset);
+	return true;
 }
 
 static void arm64_mov_imm(FILE *out, const char *reg, bool use_w, uint64_t value)
@@ -724,6 +752,162 @@ static bool arm64_emit_store_local(Arm64FunctionContext *ctx, const CCInstructio
 	return true;
 }
 
+static bool arm64_emit_addr_param(Arm64FunctionContext *ctx, const CCInstruction *ins)
+{
+	uint32_t index = ins->data.param.index;
+	if (index >= ctx->fn->param_count)
+	{
+		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "addr_param index %u out of range", index);
+		return false;
+	}
+	for (size_t i = 0; i < ctx->stack_size; ++i)
+	{
+		if (!arm64_spill_register_value(ctx, &ctx->stack[i], i))
+			return false;
+	}
+	const char *dst_reg = ARM64_SCRATCH_GP_REGS64[0];
+	size_t offset = ctx->param_offsets ? ctx->param_offsets[index] : 0;
+	if (!arm64_emit_stack_address(ctx->out, ctx->sink, ins->line, dst_reg, offset))
+		return false;
+	Arm64Value value;
+	memset(&value, 0, sizeof(value));
+	value.kind = ARM64_VALUE_REGISTER;
+	value.type = CC_TYPE_PTR;
+	value.is_unsigned = true;
+	value.data.reg.name = dst_reg;
+	value.data.reg.is_w = false;
+	return function_stack_push(ctx, value);
+}
+
+static bool arm64_emit_addr_local(Arm64FunctionContext *ctx, const CCInstruction *ins)
+{
+	uint32_t index = ins->data.local.index;
+	if (index >= ctx->fn->local_count)
+	{
+		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "addr_local index %u out of range", index);
+		return false;
+	}
+	for (size_t i = 0; i < ctx->stack_size; ++i)
+	{
+		if (!arm64_spill_register_value(ctx, &ctx->stack[i], i))
+			return false;
+	}
+	const char *dst_reg = ARM64_SCRATCH_GP_REGS64[0];
+	size_t offset = ctx->local_offsets ? ctx->local_offsets[index] : 0;
+	if (!arm64_emit_stack_address(ctx->out, ctx->sink, ins->line, dst_reg, offset))
+		return false;
+	Arm64Value value;
+	memset(&value, 0, sizeof(value));
+	value.kind = ARM64_VALUE_REGISTER;
+	value.type = CC_TYPE_PTR;
+	value.is_unsigned = true;
+	value.data.reg.name = dst_reg;
+	value.data.reg.is_w = false;
+	return function_stack_push(ctx, value);
+}
+
+static bool arm64_emit_load_indirect(Arm64FunctionContext *ctx, const CCInstruction *ins)
+{
+	Arm64Value pointer_value;
+	if (!function_stack_pop(ctx, &pointer_value))
+	{
+		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "load_indirect requires pointer");
+		return false;
+	}
+	for (size_t i = 0; i < ctx->stack_size; ++i)
+	{
+		if (!arm64_spill_register_value(ctx, &ctx->stack[i], i))
+			return false;
+	}
+	const char *ptr_reg = ARM64_SCRATCH_GP_REGS64[0];
+	if (!arm64_materialize_gp(ctx, &pointer_value, ptr_reg, false))
+		return false;
+	size_t size_bytes = arm64_type_size(ins->data.memory.type);
+	bool is_unsigned = ins->data.memory.is_unsigned;
+	FILE *out = ctx->out;
+	const char *dst64 = ARM64_SCRATCH_GP_REGS64[1];
+	const char *dst32 = ARM64_SCRATCH_GP_REGS32[1];
+	const char *result_reg = dst64;
+	bool use_w = false;
+	if (size_bytes >= 8)
+	{
+		fprintf(out, "    ldr %s, [%s]\n", dst64, ptr_reg);
+		result_reg = dst64;
+		use_w = false;
+	}
+	else if (size_bytes == 4)
+	{
+		fprintf(out, "    ldr %s, [%s]\n", dst32, ptr_reg);
+		result_reg = dst32;
+		use_w = true;
+	}
+	else if (size_bytes == 2)
+	{
+		if (is_unsigned)
+			fprintf(out, "    ldrh %s, [%s]\n", dst32, ptr_reg);
+		else
+			fprintf(out, "    ldrsh %s, [%s]\n", dst32, ptr_reg);
+		result_reg = dst32;
+		use_w = true;
+	}
+	else
+	{
+		if (is_unsigned)
+			fprintf(out, "    ldrb %s, [%s]\n", dst32, ptr_reg);
+		else
+			fprintf(out, "    ldrsb %s, [%s]\n", dst32, ptr_reg);
+		result_reg = dst32;
+		use_w = true;
+	}
+	Arm64Value result;
+	memset(&result, 0, sizeof(result));
+	result.kind = ARM64_VALUE_REGISTER;
+	result.type = ins->data.memory.type;
+	result.is_unsigned = is_unsigned;
+	result.data.reg.name = result_reg;
+	result.data.reg.is_w = use_w;
+	return function_stack_push(ctx, result);
+}
+
+static bool arm64_emit_store_indirect(Arm64FunctionContext *ctx, const CCInstruction *ins)
+{
+	Arm64Value value;
+	Arm64Value pointer_value;
+	if (!function_stack_pop(ctx, &value))
+	{
+		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "store_indirect requires value");
+		return false;
+	}
+	if (!function_stack_pop(ctx, &pointer_value))
+	{
+		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "store_indirect requires pointer");
+		return false;
+	}
+	for (size_t i = 0; i < ctx->stack_size; ++i)
+	{
+		if (!arm64_spill_register_value(ctx, &ctx->stack[i], i))
+			return false;
+	}
+	const char *ptr_reg = ARM64_SCRATCH_GP_REGS64[0];
+	if (!arm64_materialize_gp(ctx, &pointer_value, ptr_reg, false))
+		return false;
+	size_t size_bytes = arm64_type_size(ins->data.memory.type);
+	bool use_w = (size_bytes <= 4);
+	const char *value_reg = use_w ? ARM64_SCRATCH_GP_REGS32[1] : ARM64_SCRATCH_GP_REGS64[1];
+	if (!arm64_materialize_gp(ctx, &value, value_reg, use_w))
+		return false;
+	FILE *out = ctx->out;
+	if (size_bytes >= 8)
+		fprintf(out, "    str %s, [%s]\n", value_reg, ptr_reg);
+	else if (size_bytes == 4)
+		fprintf(out, "    str %s, [%s]\n", value_reg, ptr_reg);
+	else if (size_bytes == 2)
+		fprintf(out, "    strh %s, [%s]\n", value_reg, ptr_reg);
+	else
+		fprintf(out, "    strb %s, [%s]\n", value_reg, ptr_reg);
+	return true;
+}
+
 static bool arm64_emit_binop(Arm64FunctionContext *ctx, const CCInstruction *ins)
 {
 	if (ins->data.binop.op != CC_BINOP_ADD)
@@ -784,59 +968,141 @@ static bool arm64_emit_binop(Arm64FunctionContext *ctx, const CCInstruction *ins
 
 static bool arm64_emit_convert(Arm64FunctionContext *ctx, const CCInstruction *ins)
 {
-	if (ins->data.convert.kind != CC_CONVERT_SEXT)
-	{
-		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend only implements sign-extension conversions currently");
-		return false;
-	}
 	Arm64Value value;
 	if (!function_stack_pop(ctx, &value))
 	{
 		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "convert requires value on stack");
 		return false;
 	}
+	CCConvertKind kind = ins->data.convert.kind;
+	CCValueType from_type = ins->data.convert.from_type;
 	CCValueType to_type = ins->data.convert.to_type;
+	size_t from_size = arm64_type_size(from_type);
 	size_t to_size = arm64_type_size(to_type);
-	bool use_w = (to_size <= 4);
-	const char *dst_reg = use_w ? ARM64_SCRATCH_GP_REGS32[0] : ARM64_SCRATCH_GP_REGS64[0];
-	if (!arm64_materialize_gp(ctx, &value, dst_reg, use_w))
+	const char *xreg = ARM64_SCRATCH_GP_REGS64[0];
+	const char *wreg = ARM64_SCRATCH_GP_REGS32[0];
+	bool load_with_w = (from_size <= 4);
+	const char *materialize_reg = load_with_w ? wreg : xreg;
+	if (!arm64_materialize_gp(ctx, &value, materialize_reg, load_with_w))
 		return false;
-	size_t from_size = arm64_type_size(ins->data.convert.from_type);
-	bool from_signed = cc_value_type_is_signed(ins->data.convert.from_type);
 	FILE *out = ctx->out;
-	char wdst[8];
-	snprintf(wdst, sizeof(wdst), "w%s", dst_reg + 1);
-	if (!from_signed)
+	switch (kind)
 	{
-		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "sext conversion requires signed source type");
+	case CC_CONVERT_SEXT:
+	{
+		if (!cc_value_type_is_integer(from_type) || !cc_value_type_is_integer(to_type))
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "sext conversion requires integer types");
+			return false;
+		}
+		if (to_size < from_size)
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "sext destination must be at least source width");
+			return false;
+		}
+		if (!cc_value_type_is_signed(from_type))
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "sext conversion requires signed source type");
+			return false;
+		}
+		if (from_size == 1)
+		{
+			if (to_size > 4)
+				fprintf(out, "    sxtb %s, %s\n", xreg, wreg);
+			else
+				fprintf(out, "    sxtb %s, %s\n", wreg, wreg);
+		}
+		else if (from_size == 2)
+		{
+			if (to_size > 4)
+				fprintf(out, "    sxth %s, %s\n", xreg, wreg);
+			else
+				fprintf(out, "    sxth %s, %s\n", wreg, wreg);
+		}
+		else if (from_size == 4)
+		{
+			if (to_size > 4)
+				fprintf(out, "    sxtw %s, %s\n", xreg, wreg);
+		}
+		else if (from_size != to_size)
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "sext from %zu bytes unsupported", from_size);
+			return false;
+		}
+		break;
+	}
+	case CC_CONVERT_ZEXT:
+	{
+		if (!cc_value_type_is_integer(from_type) || !cc_value_type_is_integer(to_type))
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "zext conversion requires integer types");
+			return false;
+		}
+		if (to_size < from_size)
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "zext destination must be at least source width");
+			return false;
+		}
+		if (from_size == 1)
+			fprintf(out, "    uxtb %s, %s\n", wreg, wreg);
+		else if (from_size == 2)
+			fprintf(out, "    uxth %s, %s\n", wreg, wreg);
+		else if (from_size == 4 && to_size > 4)
+			fprintf(out, "    uxtw %s, %s\n", xreg, wreg);
+		else if (from_size != 4 && from_size != 8 && from_size != to_size)
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "zext from %zu bytes unsupported", from_size);
+			return false;
+		}
+		break;
+	}
+	case CC_CONVERT_TRUNC:
+	{
+		if (!cc_value_type_is_integer(from_type) || !cc_value_type_is_integer(to_type))
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "trunc conversion requires integer types");
+			return false;
+		}
+		if (to_size >= from_size)
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "trunc destination must be narrower than source");
+			return false;
+		}
+		if (to_size == 1)
+			fprintf(out, "    uxtb %s, %s\n", wreg, wreg);
+		else if (to_size == 2)
+			fprintf(out, "    uxth %s, %s\n", wreg, wreg);
+		else if (to_size == 4)
+		{
+			/* writing to the 32-bit view already truncates */
+		}
+		else
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "trunc to %zu bytes unsupported", to_size);
+			return false;
+		}
+		break;
+	}
+	case CC_CONVERT_BITCAST:
+	{
+		if (from_size != to_size)
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "bitcast requires equal source and destination sizes");
+			return false;
+		}
+		break;
+	}
+	default:
+		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "convert kind %d not supported yet on arm64 backend", (int)kind);
 		return false;
-	}
-	if (from_size == 1)
-	{
-		if (use_w)
-			fprintf(out, "    sxtb %s, %s\n", dst_reg, dst_reg);
-		else
-			fprintf(out, "    sxtb %s, %s\n", dst_reg, wdst);
-	}
-	else if (from_size == 2)
-	{
-		if (use_w)
-			fprintf(out, "    sxth %s, %s\n", dst_reg, dst_reg);
-		else
-			fprintf(out, "    sxth %s, %s\n", dst_reg, wdst);
-	}
-	else if (from_size == 4)
-	{
-		if (!use_w)
-			fprintf(out, "    sxtw %s, %s\n", dst_reg, wdst);
 	}
 	Arm64Value result;
 	memset(&result, 0, sizeof(result));
 	result.kind = ARM64_VALUE_REGISTER;
 	result.type = to_type;
-	result.is_unsigned = !cc_value_type_is_signed(to_type);
-	result.data.reg.name = dst_reg;
-	result.data.reg.is_w = use_w;
+	result.is_unsigned = (to_type == CC_TYPE_PTR) || !cc_value_type_is_signed(to_type);
+	result.data.reg.name = (to_size <= 4) ? wreg : xreg;
+	result.data.reg.is_w = (to_size <= 4);
 	return function_stack_push(ctx, result);
 }
 
@@ -1090,6 +1356,14 @@ static bool arm64_emit_instruction(Arm64FunctionContext *ctx, const CCInstructio
 		return arm64_emit_load_local(ctx, ins);
 	case CC_INSTR_STORE_LOCAL:
 		return arm64_emit_store_local(ctx, ins);
+	case CC_INSTR_ADDR_PARAM:
+		return arm64_emit_addr_param(ctx, ins);
+	case CC_INSTR_ADDR_LOCAL:
+		return arm64_emit_addr_local(ctx, ins);
+	case CC_INSTR_LOAD_INDIRECT:
+		return arm64_emit_load_indirect(ctx, ins);
+	case CC_INSTR_STORE_INDIRECT:
+		return arm64_emit_store_indirect(ctx, ins);
 	case CC_INSTR_CALL:
 		return arm64_emit_call(ctx, ins);
 	case CC_INSTR_BINOP:
