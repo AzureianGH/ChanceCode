@@ -42,6 +42,7 @@ ChanceCode/
 │   └── support/        # Shared helpers
 ├── backends/
 │   ├── backend_x86.c   # Reference x86-64 backend
+│   ├── backend_arm64.c # macOS arm64 backend (Darwin ABI)
 │   └── ...
 ├── tests/
 │   ├── *.ccb           # Sample bytecode inputs

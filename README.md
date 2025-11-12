@@ -10,12 +10,13 @@ The project ships both a reusable library (headers under `include/cc`) and a com
 - Optimisation hooks (`cc_module_optimize`) used by both the CLI and external tools.
 - Backend registry with discovery helpers (`cc_backend_register`, `cc_backend_find`, `cc_backend_at`).
 - Reference x86-64 backend supporting NASM-style and GAS/`.intel_syntax` assembly flavours, configurable ABI (Windows vs System V), and `--option` overrides.
+- New ARM64 macOS backend that targets the Darwin ABI, reuses shared optimisations, and honours backend-specific options.
 - Binary serializer (`cc_module_write_binary`) that produces compact `.ccbin` blobs suitable for bundling inside `.cclib` archives.
 
 ## Repository Layout
 - `include/cc/` — public headers for consumers (`backend.h`, `bytecode.h`, `diagnostics.h`, `loader.h`).
 - `src/` — backend registry, IR utilities, diagnostics plumbing, textual loader, and CLI entrypoint.
-- `backends/` — built-in backend implementations (currently `backend_x86.c`).
+- `backends/` — built-in backend implementations (`backend_x86.c`, `backend_arm64.c`).
 - `tests/` — sample `.ccb` inputs plus expected backend outputs wired into CTest.
 - `docs/` — detailed architecture notes and design guides.
 
@@ -41,9 +42,9 @@ ctest --preset mingw-release
 
 ```
 chancecodec input.ccb \
-	--backend x86 \
-	--output output.asm \
-	--option target-os=windows \
+	--backend arm64-macos \
+	--output output.s \
+	--option target-os=macos \
 	--emit-ccbin output.ccbin
 ```
 
@@ -55,8 +56,9 @@ Important flags:
 - `--option key=value` — forward backend-specific switches (e.g. `target-os=linux`).
 - `-O0|-O1|-O2` — enable IR optimisation passes before emission.
 
-The bundled x86 backends recognise:
-- `target-os=windows|linux` — choose between Win64 and System V ABIs.
+The bundled backends recognise:
+- `target-os=windows|linux` — choose between Win64 and System V ABIs for x86-64.
+- `target-os=macos` — select the Darwin ABI for arm64 (required).
 - Select NASM syntax with `--backend x86` (default) or GAS `.intel_syntax` with `--backend x86-gas`.
 
 Backends may expose additional keys via `--option`; the CLI simply forwards them.
