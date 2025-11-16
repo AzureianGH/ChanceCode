@@ -119,6 +119,15 @@ static void cc_function_free(CCFunction *fn)
     fn->return_type = CC_TYPE_VOID;
     fn->is_varargs = false;
     fn->is_noreturn = false;
+    fn->is_literal = false;
+    if (fn->literal_lines)
+    {
+        for (size_t i = 0; i < fn->literal_count; ++i)
+            free(fn->literal_lines[i]);
+        free(fn->literal_lines);
+    }
+    fn->literal_lines = NULL;
+    fn->literal_count = 0;
 }
 
 static void cc_global_free(CCGlobal *global)
@@ -340,6 +349,9 @@ CCFunction *cc_module_add_function(CCModule *module, const char *name)
     fn->return_type = CC_TYPE_VOID;
     fn->is_varargs = false;
     fn->is_noreturn = false;
+    fn->is_literal = false;
+    fn->literal_lines = NULL;
+    fn->literal_count = 0;
     return fn;
 }
 

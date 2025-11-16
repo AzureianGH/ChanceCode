@@ -26,11 +26,15 @@ typedef struct LoaderState
     PendingAddrGlobal *pending_addr_globals;
     size_t pending_addr_global_count;
     size_t pending_addr_global_capacity;
+    int reading_literal;
+    CCFunction *literal_fn;
 } LoaderState;
 
 static CCGlobal *find_global(CCModule *module, const char *name);
 static CCFunction *find_function(CCModule *module, const char *name);
 static char *duplicate_token(const char *token);
+static void strip_trailing_newline(char *line);
+static bool cc_function_literal_append(CCFunction *fn, const char *text);
 
 static void loader_diag(LoaderState *st, CCDiagnosticSeverity severity, size_t line, const char *fmt, ...)
 {
@@ -390,6 +394,36 @@ static char *duplicate_token(const char *token)
         return NULL;
     memcpy(copy, token, len + 1);
     return copy;
+}
+
+static void strip_trailing_newline(char *line)
+{
+    if (!line)
+        return;
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+    {
+        line[len - 1] = '\0';
+        --len;
+    }
+}
+
+static bool cc_function_literal_append(CCFunction *fn, const char *text)
+{
+    if (!fn || !text)
+        return false;
+    char *copy = duplicate_token(text);
+    if (!copy)
+        return false;
+    char **new_lines = (char **)realloc(fn->literal_lines, (fn->literal_count + 1) * sizeof(char *));
+    if (!new_lines)
+    {
+        free(copy);
+        return false;
+    }
+    fn->literal_lines = new_lines;
+    fn->literal_lines[fn->literal_count++] = copy;
+    return true;
 }
 
 static bool ccbin_read_exact(FILE *file, void *buffer, size_t size)
@@ -2611,7 +2645,47 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
     while (fgets(linebuf, sizeof(linebuf), file))
     {
         ++st.line;
+        strip_trailing_newline(linebuf);
+        char raw_line[sizeof(linebuf)];
+        memcpy(raw_line, linebuf, sizeof(raw_line));
         char *line = trim(linebuf);
+
+        if (st.reading_literal)
+        {
+            if (strncmp(line, ".endliteral", 11) == 0 && line[11] == '\0')
+            {
+                if (!st.literal_fn || st.literal_fn->literal_count == 0)
+                {
+                    loader_diag(&st, CC_DIAG_ERROR, st.line, "empty literal block");
+                    success = false;
+                    break;
+                }
+                st.literal_fn->is_literal = true;
+                st.literal_fn = NULL;
+                st.reading_literal = 0;
+                continue;
+            }
+            if (strncmp(line, ".endfunc", 8) == 0 && line[8] == '\0')
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, "missing .endliteral before .endfunc");
+                success = false;
+                break;
+            }
+            if (!st.literal_fn)
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, ".literal block without target function");
+                success = false;
+                break;
+            }
+            if (!cc_function_literal_append(st.literal_fn, raw_line))
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, "failed to record literal line");
+                success = false;
+                break;
+            }
+            continue;
+        }
+
         if (*line == '\0' || *line == '#')
             continue;
 
@@ -2866,6 +2940,19 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             continue;
         }
 
+        if (strncmp(line, ".literal", 8) == 0 && line[8] == '\0')
+        {
+            if (current_fn->is_literal || current_fn->literal_count > 0 || st.reading_literal)
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, "duplicate .literal block");
+                success = false;
+                break;
+            }
+            st.reading_literal = 1;
+            st.literal_fn = current_fn;
+            continue;
+        }
+
         if (!params_set && current_fn->param_count > 0)
         {
             loader_diag(&st, CC_DIAG_ERROR, st.line, "encountered instruction before .params");
@@ -2875,6 +2962,13 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
         if (!locals_set && current_fn->local_count > 0)
         {
             loader_diag(&st, CC_DIAG_ERROR, st.line, "encountered instruction before .locals");
+            success = false;
+            break;
+        }
+
+        if (current_fn->is_literal)
+        {
+            loader_diag(&st, CC_DIAG_ERROR, st.line, "literal functions cannot contain bytecode instructions");
             success = false;
             break;
         }
@@ -2896,6 +2990,11 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
         else if (current_fn)
         {
             loader_diag(&st, CC_DIAG_ERROR, st.line, "unterminated function '%s'", current_fn->name);
+            success = false;
+        }
+        else if (st.reading_literal)
+        {
+            loader_diag(&st, CC_DIAG_ERROR, st.line, "unterminated .literal block");
             success = false;
         }
     }

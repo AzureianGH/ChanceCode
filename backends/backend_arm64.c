@@ -114,6 +114,8 @@ typedef struct
 	size_t spill_size;
 } Arm64ArgLocation;
 
+static bool arm64_spill_register_value(Arm64FunctionContext *ctx, Arm64Value *value, size_t stack_index);
+
 static void emit_diag(CCDiagnosticSink *sink, CCDiagnosticSeverity severity, size_t line, const char *fmt, ...)
 {
 	if (!sink || !sink->callback)
@@ -417,7 +419,14 @@ static bool function_stack_push(Arm64FunctionContext *ctx, Arm64Value value)
 {
 	if (!function_stack_reserve(ctx, ctx->stack_size + 1))
 		return false;
-	ctx->stack[ctx->stack_size++] = value;
+	size_t slot = ctx->stack_size;
+	ctx->stack[slot] = value;
+	if (value.kind == ARM64_VALUE_REGISTER)
+	{
+		if (!arm64_spill_register_value(ctx, &ctx->stack[slot], slot))
+			return false;
+	}
+	ctx->stack_size++;
 	return true;
 }
 
@@ -637,6 +646,18 @@ static bool arm64_spill_register_value(Arm64FunctionContext *ctx, Arm64Value *va
 	value->data.stack.offset = offset;
 	value->data.stack.size_bytes = size_bytes;
 	value->data.stack.is_signed = cc_value_type_is_signed(value->type) && !value->is_unsigned;
+	return true;
+}
+
+static bool arm64_spill_value_stack(Arm64FunctionContext *ctx)
+{
+	if (!ctx)
+		return false;
+	for (size_t i = 0; i < ctx->stack_size; ++i)
+	{
+		if (!arm64_spill_register_value(ctx, &ctx->stack[i], i))
+			return false;
+	}
 	return true;
 }
 
@@ -922,6 +943,8 @@ static bool arm64_emit_binop(Arm64FunctionContext *ctx, const CCInstruction *ins
 		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "binop requires two operands");
 		return false;
 	}
+	if (!arm64_spill_value_stack(ctx))
+		return false;
 	size_t result_size = arm64_type_size(ins->data.binop.type);
 	bool use_w = (result_size <= 4);
 	const char *dst_reg = use_w ? ARM64_SCRATCH_GP_REGS32[0] : ARM64_SCRATCH_GP_REGS64[0];
@@ -974,6 +997,8 @@ static bool arm64_emit_convert(Arm64FunctionContext *ctx, const CCInstruction *i
 		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "convert requires value on stack");
 		return false;
 	}
+	if (!arm64_spill_value_stack(ctx))
+		return false;
 	CCConvertKind kind = ins->data.convert.kind;
 	CCValueType from_type = ins->data.convert.from_type;
 	CCValueType to_type = ins->data.convert.to_type;
@@ -1380,10 +1405,36 @@ static bool arm64_emit_instruction(Arm64FunctionContext *ctx, const CCInstructio
 	}
 }
 
+static bool arm64_emit_literal_function(Arm64FunctionContext *ctx)
+{
+	if (!ctx || !ctx->fn)
+		return false;
+	if (!ctx->fn->literal_lines || ctx->fn->literal_count == 0)
+	{
+		const char *name = (ctx->fn && ctx->fn->name) ? ctx->fn->name : "<literal>";
+		emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "literal function '%s' has no body", name);
+		return false;
+	}
+	char symbol_buf[256];
+	const char *fn_symbol = symbol_with_underscore(ctx->fn->name, symbol_buf, sizeof(symbol_buf));
+	fprintf(ctx->out, ".globl %s\n", fn_symbol ? fn_symbol : ctx->fn->name);
+	fprintf(ctx->out, ".p2align 2\n");
+	fprintf(ctx->out, "%s:\n", fn_symbol ? fn_symbol : ctx->fn->name);
+	for (size_t i = 0; i < ctx->fn->literal_count; ++i)
+	{
+		const char *line = ctx->fn->literal_lines[i] ? ctx->fn->literal_lines[i] : "";
+		fprintf(ctx->out, "%s\n", line);
+	}
+	return true;
+}
+
 static bool arm64_emit_function(Arm64FunctionContext *ctx)
 {
 	if (!ctx || !ctx->fn)
 		return false;
+
+	if (ctx->fn->is_literal)
+		return arm64_emit_literal_function(ctx);
 
 	ctx->param_offsets = NULL;
 	ctx->param_types = NULL;

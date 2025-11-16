@@ -274,6 +274,9 @@ extern "C"
         CCInstruction *instructions;
         size_t instruction_count;
         size_t instruction_capacity;
+        bool is_literal;
+        char **literal_lines;
+        size_t literal_count;
     } CCFunction;
 
     typedef struct

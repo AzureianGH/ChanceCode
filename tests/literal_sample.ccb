@@ -1,0 +1,9 @@
+ccbytecode 2
+
+.func literal_sample ret=i32 params=0 locals=1
+.locals i32
+.literal
+    mov dword [rbp-4], 7
+    mov eax, dword [rbp-4]
+.endliteral
+.endfunc
