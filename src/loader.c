@@ -35,6 +35,8 @@ static CCFunction *find_function(CCModule *module, const char *name);
 static char *duplicate_token(const char *token);
 static void strip_trailing_newline(char *line);
 static bool cc_function_literal_append(CCFunction *fn, const char *text);
+static bool mark_function_preserve(LoaderState *st, const char *name);
+static bool mark_function_force_inline_literal(LoaderState *st, const char *name);
 
 static void loader_diag(LoaderState *st, CCDiagnosticSeverity severity, size_t line, const char *fmt, ...)
 {
@@ -96,6 +98,28 @@ static bool mark_symbol_noreturn(LoaderState *st, const char *name)
         return true;
     }
     return false;
+}
+
+static bool mark_function_preserve(LoaderState *st, const char *name)
+{
+    if (!st || !name)
+        return false;
+    CCFunction *fn = find_function(st->module, name);
+    if (!fn)
+        return false;
+    fn->is_preserve = true;
+    return true;
+}
+
+static bool mark_function_force_inline_literal(LoaderState *st, const char *name)
+{
+    if (!st || !name)
+        return false;
+    CCFunction *fn = find_function(st->module, name);
+    if (!fn)
+        return false;
+    fn->force_inline_literal = true;
+    return true;
 }
 
 static bool pending_noreturn_add(LoaderState *st, const char *name)
@@ -2776,6 +2800,76 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             continue;
         }
 
+        if (strncmp(line, ".preserve", 9) == 0)
+        {
+            char *cursor = line + 9;
+            while (*cursor && isspace((unsigned char)*cursor))
+                ++cursor;
+            if (*cursor == '\0')
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, ".preserve requires a function name");
+                success = false;
+                break;
+            }
+            char *name = cursor;
+            while (*cursor && !isspace((unsigned char)*cursor))
+                ++cursor;
+            if (*cursor)
+            {
+                *cursor++ = '\0';
+                while (*cursor && isspace((unsigned char)*cursor))
+                    ++cursor;
+                if (*cursor != '\0')
+                {
+                    loader_diag(&st, CC_DIAG_ERROR, st.line, "unexpected tokens after .preserve symbol");
+                    success = false;
+                    break;
+                }
+            }
+            if (!mark_function_preserve(&st, name))
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, "unknown function '%s' in .preserve", name);
+                success = false;
+                break;
+            }
+            continue;
+        }
+
+        if (strncmp(line, ".force-inline-literal", 21) == 0)
+        {
+            char *cursor = line + 21;
+            while (*cursor && isspace((unsigned char)*cursor))
+                ++cursor;
+            if (*cursor == '\0')
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, ".force-inline-literal requires a function name");
+                success = false;
+                break;
+            }
+            char *name = cursor;
+            while (*cursor && !isspace((unsigned char)*cursor))
+                ++cursor;
+            if (*cursor)
+            {
+                *cursor++ = '\0';
+                while (*cursor && isspace((unsigned char)*cursor))
+                    ++cursor;
+                if (*cursor != '\0')
+                {
+                    loader_diag(&st, CC_DIAG_ERROR, st.line, "unexpected tokens after .force-inline-literal symbol");
+                    success = false;
+                    break;
+                }
+            }
+            if (!mark_function_force_inline_literal(&st, name))
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, "unknown function '%s' in .force-inline-literal", name);
+                success = false;
+                break;
+            }
+            continue;
+        }
+
         if (strncmp(line, ".func", 5) == 0)
         {
             if (current_fn)
@@ -2876,6 +2970,14 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
                 else if (strcmp(token, "no-return") == 0 || strcmp(token, "noreturn") == 0)
                 {
                     current_fn->is_noreturn = true;
+                }
+                else if (strcmp(token, "preserve") == 0)
+                {
+                    current_fn->is_preserve = true;
+                }
+                else if (strcmp(token, "force-inline-literal") == 0)
+                {
+                    current_fn->force_inline_literal = true;
                 }
                 else
                 {

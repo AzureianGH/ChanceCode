@@ -120,6 +120,7 @@ static void cc_function_free(CCFunction *fn)
     fn->is_varargs = false;
     fn->is_noreturn = false;
     fn->is_literal = false;
+    fn->force_inline_literal = false;
     if (fn->literal_lines)
     {
         for (size_t i = 0; i < fn->literal_count; ++i)

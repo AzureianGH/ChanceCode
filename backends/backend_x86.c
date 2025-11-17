@@ -1988,12 +1988,12 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
 {
     bool is_indirect = (ins->kind == CC_INSTR_CALL_INDIRECT) || (ins->data.call.symbol == NULL);
     bool pointer_in_r11 = false;
-#define CALL_FAIL_RETURN()                                                                 \
-    do                                                                                     \
-    {                                                                                      \
-        if (pointer_in_r11)                                                                 \
-            ctx->reg_r11_in_use = false;                                                   \
-        return false;                                                                       \
+#define CALL_FAIL_RETURN()               \
+    do                                   \
+    {                                    \
+        if (pointer_in_r11)              \
+            ctx->reg_r11_in_use = false; \
+        return false;                    \
     } while (0)
     x86_flush_virtual_stack(ctx);
     size_t arg_count = ins->data.call.arg_count;
@@ -2001,7 +2001,7 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     if (ctx->stack_size < required_values)
     {
         const char *name = ins->data.call.symbol ? ins->data.call.symbol : "<indirect>";
-    emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "call '%s' missing %zu argument%s", name, arg_count, arg_count == 1 ? "" : "s");
+        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "call '%s' missing %zu argument%s", name, arg_count, arg_count == 1 ? "" : "s");
         CALL_FAIL_RETURN();
     }
     const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;

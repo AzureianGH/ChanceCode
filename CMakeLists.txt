@@ -21,6 +21,7 @@ add_library(chancecode_backends
     backends/backend_x86.c
     backends/backend_arm64.c
     backends/builtins.c
+    backends/backend_bslash.c
 )
 
 target_link_libraries(chancecode_backends
