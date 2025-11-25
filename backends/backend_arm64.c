@@ -109,6 +109,9 @@ typedef struct
 	size_t temp_area_size;
 	size_t temp_slot_stride;
 	size_t dynamic_sp_offset;
+	bool has_vararg_area;
+	size_t vararg_area_offset;
+	size_t vararg_gp_start;
 	Arm64StackSnapshot *stack_snapshots;
 	size_t stack_snapshot_count;
 	size_t stack_snapshot_capacity;
@@ -1300,7 +1303,14 @@ static bool arm64_emit_addr_param(Arm64FunctionContext *ctx, const CCInstruction
 	const char *dst_reg = ARM64_SCRATCH_GP_REGS64[0];
 	if (wants_vararg_base)
 	{
-		fprintf(ctx->out, "    add %s, x29, #16\n", dst_reg);
+		if (!ctx->has_vararg_area)
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "vararg base requested in non-varargs function");
+			return false;
+		}
+		size_t offset = ctx->vararg_area_offset + ctx->vararg_gp_start * 8;
+		if (!arm64_emit_stack_address(ctx, ins->line, dst_reg, offset))
+			return false;
 	}
 	else
 	{
@@ -2077,6 +2087,7 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		Arm64Value *value = &ctx->stack[ctx->stack_size - arg_count + i];
 		CCValueType arg_type = ins->data.call.arg_types ? ins->data.call.arg_types[i] : CC_TYPE_I64;
 		bool is_float = (arg_type == CC_TYPE_F32) || (arg_type == CC_TYPE_F64);
+		bool is_vararg_arg = call_declares_varargs && (i >= fixed_params);
 		Arm64ArgLocation *loc = locations ? &locations[i] : NULL;
 
 		if (is_float)
@@ -2104,6 +2115,29 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 				loc->fp_is_s = use_s;
 				loc->type = arg_type;
 				loc->type_is_signed = false;
+			}
+			if (is_vararg_arg)
+			{
+				if (gp_used >= sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]))
+				{
+					emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend cannot mirror vararg float into GP register (ran out of x regs)");
+					goto cleanup;
+				}
+				const size_t gp_index = gp_used++;
+				const char *gp_reg64 = ARM64_GP_REGS64[gp_index];
+				const char *gp_reg32 = ARM64_GP_REGS32[gp_index];
+				if (use_s)
+					fprintf(ctx->out, "    fmov %s, %s\n", gp_reg32, target_reg);
+				else
+					fprintf(ctx->out, "    fmov %s, %s\n", gp_reg64, target_reg);
+				if (loc)
+				{
+					loc->uses_gp_reg = true;
+					loc->gp_is_w = false;
+					loc->gp_reg_index = gp_index;
+					loc->type = arg_type;
+					loc->type_is_signed = false;
+				}
 			}
 			fp_used++;
 		}
@@ -2397,6 +2431,9 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	ctx->stack_snapshots = NULL;
 	ctx->stack_snapshot_count = 0;
 	ctx->stack_snapshot_capacity = 0;
+	ctx->has_vararg_area = false;
+	ctx->vararg_area_offset = 0;
+	ctx->vararg_gp_start = 0;
 
 	size_t param_count = ctx->fn->param_count;
 	size_t local_count = ctx->fn->local_count;
@@ -2442,6 +2479,13 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 		}
 	}
 
+	if (ctx->fn->is_varargs)
+	{
+		ctx->has_vararg_area = true;
+		ctx->vararg_area_offset = slot_index * 8;
+		slot_index += sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]);
+	}
+
 	param_local_bytes = slot_index * 8;
 	ctx->max_stack_depth = arm64_compute_max_stack_depth(ctx->fn);
 	ctx->temp_slot_stride = 8;
@@ -2475,6 +2519,7 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 		{
 			if (fp_param_index >= sizeof(ARM64_FP_REGS) / sizeof(ARM64_FP_REGS[0]))
 			{
+
 				emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "arm64 backend only supports up to 8 floating parameters presently");
 				goto fail;
 			}
@@ -2501,6 +2546,18 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 			fprintf(ctx->out, "    str %s, [sp, #%zu]\n", ARM64_GP_REGS64[gp_param_index], addr);
 		gp_param_index++;
 	}
+
+		if (ctx->has_vararg_area)
+		{
+			ctx->vararg_gp_start = gp_param_index;
+			size_t base_offset = ctx->vararg_area_offset;
+			size_t gp_reg_count = sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]);
+			for (size_t reg = 0; reg < gp_reg_count; ++reg)
+			{
+				size_t addr = arm64_frame_offset(ctx, base_offset + reg * 8);
+				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", ARM64_GP_REGS64[reg], addr);
+			}
+		}
 
 	for (size_t i = 0; i < ctx->fn->instruction_count; ++i)
 	{
