@@ -1988,12 +1988,12 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
 {
     bool is_indirect = (ins->kind == CC_INSTR_CALL_INDIRECT) || (ins->data.call.symbol == NULL);
     bool pointer_in_r11 = false;
-#define CALL_FAIL_RETURN()                                                                 \
-    do                                                                                     \
-    {                                                                                      \
-        if (pointer_in_r11)                                                                 \
-            ctx->reg_r11_in_use = false;                                                   \
-        return false;                                                                       \
+#define CALL_FAIL_RETURN()               \
+    do                                   \
+    {                                    \
+        if (pointer_in_r11)              \
+            ctx->reg_r11_in_use = false; \
+        return false;                    \
     } while (0)
     x86_flush_virtual_stack(ctx);
     size_t arg_count = ins->data.call.arg_count;
@@ -2001,7 +2001,7 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     if (ctx->stack_size < required_values)
     {
         const char *name = ins->data.call.symbol ? ins->data.call.symbol : "<indirect>";
-    emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "call '%s' missing %zu argument%s", name, arg_count, arg_count == 1 ? "" : "s");
+        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "call '%s' missing %zu argument%s", name, arg_count, arg_count == 1 ? "" : "s");
         CALL_FAIL_RETURN();
     }
     const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
@@ -2434,6 +2434,28 @@ static void emit_function_prologue(X86FunctionContext *ctx)
     }
 }
 
+static bool emit_literal_body(X86FunctionContext *ctx)
+{
+    if (!ctx || !ctx->fn)
+        return false;
+    if (!ctx->fn->literal_lines || ctx->fn->literal_count == 0)
+    {
+        const char *name = ctx->fn->name ? ctx->fn->name : "<literal>";
+        emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "literal function '%s' is missing body text", name);
+        return false;
+    }
+    for (size_t i = 0; i < ctx->fn->literal_count; ++i)
+    {
+        const char *line = ctx->fn->literal_lines[i] ? ctx->fn->literal_lines[i] : "";
+        fprintf(ctx->out, "%s\n", line);
+    }
+    if (ctx->use_frame)
+        fprintf(ctx->out, "    leave\n");
+    fprintf(ctx->out, "    ret\n");
+    ctx->saw_return = true;
+    return true;
+}
+
 static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
 {
     X86FunctionContext ctx;
@@ -2491,12 +2513,23 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
 
     emit_function_prologue(&ctx);
 
-    for (size_t i = 0; i < fn->instruction_count; ++i)
+    if (fn->is_literal)
     {
-        if (!emit_instruction(&ctx, &fn->instructions[i]))
+        if (!emit_literal_body(&ctx))
         {
             function_context_free(&ctx);
             return false;
+        }
+    }
+    else
+    {
+        for (size_t i = 0; i < fn->instruction_count; ++i)
+        {
+            if (!emit_instruction(&ctx, &fn->instructions[i]))
+            {
+                function_context_free(&ctx);
+                return false;
+            }
         }
     }
 
