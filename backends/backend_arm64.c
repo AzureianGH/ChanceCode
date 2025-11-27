@@ -41,6 +41,12 @@ typedef struct
 	size_t capacity;
 } Arm64SymbolSet;
 
+typedef struct
+{
+	char *symbol;
+	size_t fixed_param_count;
+} Arm64VarargEntry;
+
 typedef enum
 {
 	ARM64_VALUE_IMM = 0,
@@ -79,6 +85,10 @@ typedef struct
 	CCDiagnosticSink *sink;
 	Arm64StringTable strings;
 	Arm64SymbolSet externs;
+	Arm64VarargEntry *vararg_cache;
+	size_t vararg_count;
+	size_t vararg_capacity;
+	bool vararg_cache_loaded;
 	size_t string_counter;
 } Arm64ModuleContext;
 
@@ -116,6 +126,10 @@ typedef struct
 	size_t stack_snapshot_count;
 	size_t stack_snapshot_capacity;
 } Arm64FunctionContext;
+
+static void arm64_vararg_cache_load(Arm64ModuleContext *ctx);
+static void arm64_vararg_cache_destroy(Arm64ModuleContext *ctx);
+static const Arm64VarargEntry *arm64_vararg_cache_lookup(const Arm64ModuleContext *ctx, const char *symbol);
 
 typedef struct
 {
@@ -272,6 +286,15 @@ static bool arm64_lookup_signature(const Arm64ModuleContext *ctx, const char *sy
 			return true;
 		}
 	}
+	const Arm64VarargEntry *entry = arm64_vararg_cache_lookup(ctx, symbol);
+	if (entry)
+	{
+		if (out_param_count)
+			*out_param_count = entry->fixed_param_count;
+		if (out_is_varargs)
+			*out_is_varargs = true;
+		return true;
+	}
 	return false;
 }
 
@@ -416,6 +439,81 @@ static void symbol_set_destroy(Arm64SymbolSet *set)
 	set->items = NULL;
 	set->count = 0;
 	set->capacity = 0;
+}
+
+static bool arm64_vararg_cache_reserve(Arm64ModuleContext *ctx, size_t desired)
+{
+	if (!ctx)
+		return false;
+	if (ctx->vararg_capacity >= desired)
+		return true;
+	size_t new_capacity = ctx->vararg_capacity ? ctx->vararg_capacity * 2 : 8;
+	while (new_capacity < desired)
+		new_capacity *= 2;
+	Arm64VarargEntry *entries = (Arm64VarargEntry *)realloc(ctx->vararg_cache, new_capacity * sizeof(Arm64VarargEntry));
+	if (!entries)
+		return false;
+	ctx->vararg_cache = entries;
+	ctx->vararg_capacity = new_capacity;
+	return true;
+}
+
+static void arm64_vararg_cache_destroy(Arm64ModuleContext *ctx)
+{
+	if (!ctx)
+		return;
+	for (size_t i = 0; i < ctx->vararg_count; ++i)
+		free(ctx->vararg_cache[i].symbol);
+	free(ctx->vararg_cache);
+	ctx->vararg_cache = NULL;
+	ctx->vararg_count = 0;
+	ctx->vararg_capacity = 0;
+	ctx->vararg_cache_loaded = false;
+}
+
+static void arm64_vararg_cache_load(Arm64ModuleContext *ctx)
+{
+	if (!ctx || ctx->vararg_cache_loaded)
+		return;
+	ctx->vararg_cache_loaded = true;
+	FILE *fp = fopen(".chancecode_vararg_cache", "r");
+	if (!fp)
+		return;
+	char line[512];
+	while (fgets(line, sizeof(line), fp))
+	{
+		char *cursor = line;
+		while (*cursor && isspace((unsigned char)*cursor))
+			++cursor;
+		if (*cursor == '\0' || *cursor == '#')
+			continue;
+		char symbol[256];
+		unsigned long fixed = 0;
+		if (sscanf(cursor, "%255s %lu", symbol, &fixed) != 2)
+			continue;
+		if (!arm64_vararg_cache_reserve(ctx, ctx->vararg_count + 1))
+			break;
+		Arm64VarargEntry *entry = &ctx->vararg_cache[ctx->vararg_count];
+		entry->symbol = arm64_strdup(symbol);
+		if (!entry->symbol)
+			break;
+		entry->fixed_param_count = (size_t)fixed;
+		ctx->vararg_count++;
+	}
+	fclose(fp);
+}
+
+static const Arm64VarargEntry *arm64_vararg_cache_lookup(const Arm64ModuleContext *ctx, const char *symbol)
+{
+	if (!ctx || !symbol || ctx->vararg_count == 0)
+		return NULL;
+	for (size_t i = 0; i < ctx->vararg_count; ++i)
+	{
+		const Arm64VarargEntry *entry = &ctx->vararg_cache[i];
+		if (entry->symbol && strcmp(entry->symbol, symbol) == 0)
+			return entry;
+	}
+	return NULL;
 }
 
 static bool function_stack_reserve(Arm64FunctionContext *ctx, size_t desired)
@@ -2483,7 +2581,9 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	{
 		ctx->has_vararg_area = true;
 		ctx->vararg_area_offset = slot_index * 8;
-		slot_index += sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]);
+		// Reserve space for 8 GPRs (x0-x7) AND 8 FPRs (d0-d7)
+		slot_index += 8; // x0-x7
+		slot_index += 8; // d0-d7
 	}
 
 	param_local_bytes = slot_index * 8;
@@ -2552,10 +2652,22 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 			ctx->vararg_gp_start = gp_param_index;
 			size_t base_offset = ctx->vararg_area_offset;
 			size_t gp_reg_count = sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]);
+			
+			// Spill General Purpose Registers (x0-x7)
 			for (size_t reg = 0; reg < gp_reg_count; ++reg)
 			{
 				size_t addr = arm64_frame_offset(ctx, base_offset + reg * 8);
 				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", ARM64_GP_REGS64[reg], addr);
+			}
+			
+			// Spill Floating Point Registers (d0-d7)
+			// These follow immediately after the 8 GPRs (8 * 8 = 64 bytes offset)
+			size_t fp_base_offset = base_offset + (gp_reg_count * 8);
+			size_t fp_reg_count = sizeof(ARM64_FP_REGS) / sizeof(ARM64_FP_REGS[0]);
+			for (size_t reg = 0; reg < fp_reg_count; ++reg)
+			{
+				size_t addr = arm64_frame_offset(ctx, fp_base_offset + reg * 8);
+				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", ARM64_FP_REGS[reg], addr);
 			}
 		}
 
@@ -2713,6 +2825,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	ctx.out = out;
 	ctx.module = module;
 	ctx.sink = sink;
+	arm64_vararg_cache_load(&ctx);
 
 	fprintf(out, "// ChanceCode macOS ARM64 backend output\n");
 	fprintf(out, ".build_version macos, 15, 0\n");
@@ -2725,6 +2838,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 			fclose(out);
 		string_table_destroy(&ctx.strings);
 		symbol_set_destroy(&ctx.externs);
+		arm64_vararg_cache_destroy(&ctx);
 		return false;
 	}
 
@@ -2745,6 +2859,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 				fclose(out);
 			string_table_destroy(&ctx.strings);
 			symbol_set_destroy(&ctx.externs);
+			arm64_vararg_cache_destroy(&ctx);
 			return false;
 		}
 		free(fn_ctx.stack);
@@ -2758,6 +2873,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 
 	string_table_destroy(&ctx.strings);
 	symbol_set_destroy(&ctx.externs);
+	arm64_vararg_cache_destroy(&ctx);
 	return true;
 }
 

@@ -2988,6 +2988,16 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             if (!success)
                 break;
 
+            // Validate that varargs functions have at least one explicit parameter
+            if (current_fn->is_varargs && current_fn->param_count == 0)
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, 
+                    "variadic function '%s' must have at least one explicit parameter before '...'", 
+                    current_fn->name);
+                success = false;
+                break;
+            }
+
             resolve_pending_noreturn(&st, name);
 
             continue;
