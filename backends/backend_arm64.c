@@ -639,30 +639,32 @@ static bool arm64_emit_stack_address(Arm64FunctionContext *ctx, size_t line, con
 
 static void arm64_mov_imm(FILE *out, const char *reg, bool use_w, uint64_t value)
 {
-	if (value == 0)
+	uint64_t masked_value = use_w ? (value & 0xFFFFFFFFull) : value;
+	if (masked_value == 0)
 	{
 		fprintf(out, "    mov %s, %s\n", reg, use_w ? "wzr" : "xzr");
 		return;
 	}
-	unsigned shifts[] = {0, 16, 32, 48};
+	unsigned max_bits = use_w ? 32u : 64u;
 	bool emitted = false;
-	for (size_t i = 0; i < 4; ++i)
+	for (unsigned shift = 0; shift < max_bits; shift += 16)
 	{
-		uint64_t chunk = (value >> shifts[i]) & 0xFFFFu;
+		uint64_t chunk = (masked_value >> shift) & 0xFFFFu;
 		if (!chunk && !emitted)
 			continue;
 		if (!emitted)
 		{
-			fprintf(out, "    movz %s, #0x%llx%s\n", reg, (unsigned long long)chunk, use_w ? "" : ", lsl #0");
+			if (shift == 0)
+				fprintf(out, "    movz %s, #0x%llx\n", reg, (unsigned long long)chunk);
+			else
+				fprintf(out, "    movz %s, #0x%llx, lsl #%u\n", reg, (unsigned long long)chunk, shift);
 			emitted = true;
 		}
 		else if (chunk)
 		{
-			fprintf(out, "    movk %s, #0x%llx, lsl #%u\n", reg, (unsigned long long)chunk, (unsigned)(shifts[i]));
+			fprintf(out, "    movk %s, #0x%llx, lsl #%u\n", reg, (unsigned long long)chunk, shift);
 		}
 	}
-	if (!emitted)
-		fprintf(out, "    movz %s, #0\n", reg);
 }
 
 static bool arm64_adjust_sp(Arm64FunctionContext *ctx, size_t amount)
@@ -1278,11 +1280,20 @@ static bool arm64_emit_store_local(Arm64FunctionContext *ctx, const CCInstructio
 	size_t offset = ctx->local_offsets ? ctx->local_offsets[index] : 0;
 	size_t addr = arm64_frame_offset(ctx, offset);
 	size_t size_bytes = arm64_type_size(ins->data.local.type);
+	FILE *out = ctx->out;
+	if (cc_value_type_is_float(ins->data.local.type))
+	{
+		const bool is_f32 = (ins->data.local.type == CC_TYPE_F32);
+		const char *fp_reg = is_f32 ? "s0" : "d0";
+		if (!arm64_materialize_fp(ctx, &value, fp_reg, ins->data.local.type))
+			return false;
+		fprintf(out, "    str %s, [%s, #%zu]\n", fp_reg, ARM64_FRAME_REG, addr);
+		return true;
+	}
 	bool use_w = (size_bytes <= 4);
 	const char *reg = use_w ? ARM64_SCRATCH_GP_REGS32[0] : ARM64_SCRATCH_GP_REGS64[0];
 	if (!arm64_materialize_gp(ctx, &value, reg, use_w))
 		return false;
-	FILE *out = ctx->out;
 	if (size_bytes >= 8)
 		fprintf(out, "    str %s, [%s, #%zu]\n", reg, ARM64_FRAME_REG, addr);
 	else if (size_bytes == 4)
@@ -1565,10 +1576,21 @@ static bool arm64_emit_store_indirect(Arm64FunctionContext *ctx, const CCInstruc
 	if (!arm64_materialize_gp(ctx, &pointer_value, ptr_reg, false))
 		return false;
 	size_t size_bytes = arm64_type_size(ins->data.memory.type);
+	bool is_float = cc_value_type_is_float(ins->data.memory.type);
 	bool use_w = (size_bytes <= 4);
 	const char *value_reg = use_w ? ARM64_SCRATCH_GP_REGS32[1] : ARM64_SCRATCH_GP_REGS64[1];
-	if (!arm64_materialize_gp(ctx, &value, value_reg, use_w))
+	if (is_float)
+	{
+		const char *fp_reg = (ins->data.memory.type == CC_TYPE_F32) ? "s0" : "d0";
+		if (!arm64_materialize_fp(ctx, &value, fp_reg, ins->data.memory.type))
+			return false;
+		value_reg = fp_reg;
+		use_w = (ins->data.memory.type == CC_TYPE_F32);
+	}
+	else if (!arm64_materialize_gp(ctx, &value, value_reg, use_w))
+	{
 		return false;
+	}
 	FILE *out = ctx->out;
 	if (size_bytes >= 8)
 		fprintf(out, "    str %s, [%s]\n", value_reg, ptr_reg);
@@ -2048,6 +2070,46 @@ static bool arm64_emit_convert(Arm64FunctionContext *ctx, const CCInstruction *i
 			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "trunc to %zu bytes unsupported", to_size);
 			return false;
 		}
+		break;
+	}
+	case CC_CONVERT_F2I:
+	{
+		if (!from_is_float || !cc_value_type_is_integer(to_type))
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "f2i conversion expects floating source and integer destination");
+			return false;
+		}
+		const char *fp_src = (from_type == CC_TYPE_F32) ? "s0" : "d0";
+		if (from_type == CC_TYPE_F32)
+			fprintf(out, "    fmov %s, %s\n", fp_src, wreg);
+		else
+			fprintf(out, "    fmov %s, %s\n", fp_src, xreg);
+		const char *dest_reg = (to_size <= 4) ? wreg : xreg;
+		const char *instr = cc_value_type_is_signed(to_type) ? "fcvtzs" : "fcvtzu";
+		fprintf(out, "    %s %s, %s\n", instr, dest_reg, fp_src);
+		arm64_narrow_integer_result(out, dest_reg, to_size, cc_value_type_is_signed(to_type));
+		break;
+	}
+	case CC_CONVERT_I2F:
+	{
+		if (!cc_value_type_is_integer(from_type) && from_type != CC_TYPE_PTR)
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "i2f conversion expects integer or pointer source type");
+			return false;
+		}
+		if (!to_is_float)
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "i2f conversion expects floating destination type");
+			return false;
+		}
+		const char *src_reg = (from_size <= 4) ? wreg : xreg;
+		const char *fp_dst = (to_type == CC_TYPE_F32) ? "s0" : "d0";
+		const char *instr = (from_type != CC_TYPE_PTR && cc_value_type_is_signed(from_type)) ? "scvtf" : "ucvtf";
+		fprintf(out, "    %s %s, %s\n", instr, fp_dst, src_reg);
+		if (to_type == CC_TYPE_F32)
+			fprintf(out, "    fmov %s, %s\n", wreg, fp_dst);
+		else
+			fprintf(out, "    fmov %s, %s\n", xreg, fp_dst);
 		break;
 	}
 	case CC_CONVERT_BITCAST:
@@ -2775,6 +2837,173 @@ static void arm64_emit_externs(const Arm64ModuleContext *ctx)
 	fprintf(ctx->out, "\n");
 }
 
+static unsigned arm64_p2align_shift(size_t alignment)
+{
+	if (alignment == 0)
+		alignment = 1;
+	unsigned shift = 0;
+	size_t value = 1;
+	while (value < alignment)
+	{
+		value <<= 1;
+		shift++;
+	}
+	return shift;
+}
+
+static size_t arm64_global_storage_size(const CCGlobal *global)
+{
+	if (!global)
+		return 0;
+	if (global->size > 0)
+		return global->size;
+	size_t type_size = arm64_type_size(global->type);
+	if (type_size == 0)
+		type_size = 8;
+	return type_size;
+}
+
+static void arm64_emit_global_definition(const Arm64ModuleContext *ctx, const CCGlobal *global)
+{
+	if (!ctx || !ctx->out || !global || !global->name)
+		return;
+	FILE *out = ctx->out;
+	char symbol_buf[256];
+	const char *symbol = symbol_with_underscore(global->name, symbol_buf, sizeof(symbol_buf));
+	size_t align_bytes = global->alignment ? global->alignment : arm64_type_size(global->type);
+	if (align_bytes == 0)
+		align_bytes = 8;
+	unsigned align_shift = arm64_p2align_shift(align_bytes);
+	size_t storage_size = arm64_global_storage_size(global);
+	if (storage_size == 0)
+		storage_size = 8;
+
+	fprintf(out, ".globl %s\n", symbol ? symbol : global->name);
+	fprintf(out, ".p2align %u\n", align_shift);
+	fprintf(out, "%s:\n", symbol ? symbol : global->name);
+
+	size_t initialized_bytes = 0;
+	switch (global->init.kind)
+	{
+	case CC_GLOBAL_INIT_INT:
+	{
+		size_t elem_size = arm64_type_size(global->type);
+		if (elem_size == 0 || elem_size > storage_size)
+			elem_size = storage_size < 8 ? storage_size : 8;
+		uint64_t value = global->init.payload.u64;
+		if (elem_size >= 8)
+		{
+			fprintf(out, "    .quad 0x%016llx\n", (unsigned long long)value);
+			initialized_bytes = 8;
+		}
+		else if (elem_size == 4)
+		{
+			fprintf(out, "    .long 0x%08llx\n", (unsigned long long)(value & 0xFFFFFFFFULL));
+			initialized_bytes = 4;
+		}
+		else if (elem_size == 2)
+		{
+			fprintf(out, "    .short 0x%04llx\n", (unsigned long long)(value & 0xFFFFULL));
+			initialized_bytes = 2;
+		}
+		else
+		{
+			fprintf(out, "    .byte 0x%02llx\n", (unsigned long long)(value & 0xFFULL));
+			initialized_bytes = 1;
+		}
+		break;
+	}
+	case CC_GLOBAL_INIT_FLOAT:
+	{
+		if (global->type == CC_TYPE_F32)
+		{
+			union
+			{
+				float f;
+				uint32_t bits;
+			} conv;
+			conv.f = (float)global->init.payload.f64;
+			fprintf(out, "    .long 0x%08x\n", conv.bits);
+			initialized_bytes = 4;
+		}
+		else
+		{
+			union
+			{
+				double f;
+				uint64_t bits;
+			} conv;
+			conv.f = global->init.payload.f64;
+			fprintf(out, "    .quad 0x%016llx\n", (unsigned long long)conv.bits);
+			initialized_bytes = 8;
+		}
+		break;
+	}
+	case CC_GLOBAL_INIT_STRING:
+	{
+		size_t len = global->init.payload.string.length;
+		if (len > 0)
+		{
+			fprintf(out, "    .byte ");
+			for (size_t i = 0; i < len; ++i)
+			{
+				unsigned char byte = (unsigned char)global->init.payload.string.data[i];
+				fprintf(out, "%s0x%02x", (i == 0 ? "" : ", "), byte);
+			}
+			fprintf(out, ", 0\n");
+		}
+		else
+		{
+			fprintf(out, "    .byte 0\n");
+		}
+		initialized_bytes = len + 1;
+		break;
+	}
+	case CC_GLOBAL_INIT_BYTES:
+	{
+		size_t len = global->init.payload.bytes.size;
+		if (len > 0)
+		{
+			fprintf(out, "    .byte ");
+			for (size_t i = 0; i < len; ++i)
+			{
+				unsigned char byte = global->init.payload.bytes.data[i];
+				fprintf(out, "%s0x%02x", (i == 0 ? "" : ", "), byte);
+			}
+			fprintf(out, "\n");
+		}
+		initialized_bytes = len;
+		break;
+	}
+	case CC_GLOBAL_INIT_NONE:
+	default:
+		initialized_bytes = 0;
+		break;
+	}
+
+	if (initialized_bytes < storage_size)
+		fprintf(out, "    .zero %zu\n", storage_size - initialized_bytes);
+}
+
+static void arm64_emit_globals(const Arm64ModuleContext *ctx)
+{
+	if (!ctx || !ctx->module || ctx->module->global_count == 0)
+		return;
+	int current_section = -1;
+	for (size_t i = 0; i < ctx->module->global_count; ++i)
+	{
+		const CCGlobal *global = &ctx->module->globals[i];
+		int desired_section = global->is_const ? 1 : 0;
+		if (desired_section != current_section)
+		{
+			fprintf(ctx->out, "\n.section __DATA,%s\n", desired_section ? "__const" : "__data");
+			current_section = desired_section;
+		}
+		arm64_emit_global_definition(ctx, global);
+		fprintf(ctx->out, "\n");
+	}
+}
+
 static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, const CCBackendOptions *options, CCDiagnosticSink *sink, void *userdata)
 {
 	(void)backend;
@@ -2822,8 +3051,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	arm64_vararg_cache_load(&ctx);
 
 	fprintf(out, "// ChanceCode macOS ARM64 backend output\n");
-	fprintf(out, ".build_version macos, 15, 0\n");
-	fprintf(out, ".section __TEXT,__text,regular,pure_instructions\n\n");
+	fprintf(out, ".build_version macos, 15, 0\n\n");
 
 	if (!arm64_collect_externs(&ctx))
 	{
@@ -2837,6 +3065,8 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	}
 
 	arm64_emit_externs(&ctx);
+	arm64_emit_globals(&ctx);
+	fprintf(out, ".section __TEXT,__text,regular,pure_instructions\n\n");
 
 	for (size_t i = 0; i < module->function_count; ++i)
 	{
