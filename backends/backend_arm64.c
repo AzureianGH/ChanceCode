@@ -20,6 +20,9 @@ static const char *const ARM64_FP_REGS32[] = {"s0", "s1", "s2", "s3", "s4", "s5"
 static const char *const ARM64_SCRATCH_GP_REGS64[] = {"x9", "x10", "x11", "x12"};
 static const char *const ARM64_SCRATCH_GP_REGS32[] = {"w9", "w10", "w11", "w12"};
 
+#define ARM64_FRAME_REG "x27"
+#define ARM64_FRAME_REG32 "w27"
+
 typedef struct
 {
 	char *label;
@@ -118,7 +121,6 @@ typedef struct
 	size_t temp_base_offset;
 	size_t temp_area_size;
 	size_t temp_slot_stride;
-	size_t dynamic_sp_offset;
 	bool has_vararg_area;
 	size_t vararg_area_offset;
 	size_t vararg_gp_start;
@@ -617,9 +619,8 @@ static void arm64_narrow_integer_result(FILE *out, const char *dst_reg, size_t s
 
 static size_t arm64_frame_offset(const Arm64FunctionContext *ctx, size_t offset)
 {
-	if (!ctx)
-		return offset;
-	return ctx->dynamic_sp_offset + offset;
+	(void)ctx;
+	return offset;
 }
 
 static bool arm64_emit_stack_address(Arm64FunctionContext *ctx, size_t line, const char *dst_reg, size_t offset)
@@ -632,7 +633,7 @@ static bool arm64_emit_stack_address(Arm64FunctionContext *ctx, size_t line, con
 		emit_diag(ctx->sink, CC_DIAG_ERROR, line, "arm64 backend does not yet support stack offsets larger than 4095 bytes (got %zu)", absolute);
 		return false;
 	}
-	fprintf(ctx->out, "    add %s, sp, #%zu\n", dst_reg, absolute);
+	fprintf(ctx->out, "    add %s, %s, #%zu\n", dst_reg, ARM64_FRAME_REG, absolute);
 	return true;
 }
 
@@ -672,13 +673,11 @@ static bool arm64_adjust_sp(Arm64FunctionContext *ctx, size_t amount)
 	if (amount <= 4095)
 	{
 		fprintf(out, "    sub sp, sp, #%zu\n", amount);
-		ctx->dynamic_sp_offset += amount;
 		return true;
 	}
 	const char *tmp_reg = ARM64_SCRATCH_GP_REGS64[0];
 	arm64_mov_imm(out, tmp_reg, false, amount);
 	fprintf(out, "    sub sp, sp, %s\n", tmp_reg);
-	ctx->dynamic_sp_offset += amount;
 	return true;
 }
 
@@ -730,38 +729,38 @@ static bool arm64_materialize_gp(Arm64FunctionContext *ctx, Arm64Value *value, c
 		}
 		if (size_bytes >= 8)
 		{
-			fprintf(out, "    ldr %s, [sp, #%zu]\n", x_name, addr);
+			fprintf(out, "    ldr %s, [%s, #%zu]\n", x_name, ARM64_FRAME_REG, addr);
 		}
 		else if (size_bytes == 4)
 		{
 			if (!use_w && is_signed)
-				fprintf(out, "    ldrsw %s, [sp, #%zu]\n", x_name, addr);
+				fprintf(out, "    ldrsw %s, [%s, #%zu]\n", x_name, ARM64_FRAME_REG, addr);
 			else
-				fprintf(out, "    ldr %s, [sp, #%zu]\n", w_name, addr);
+				fprintf(out, "    ldr %s, [%s, #%zu]\n", w_name, ARM64_FRAME_REG, addr);
 		}
 		else if (size_bytes == 2)
 		{
 			if (is_signed)
 			{
 				if (use_w)
-					fprintf(out, "    ldrsh %s, [sp, #%zu]\n", w_name, addr);
+					fprintf(out, "    ldrsh %s, [%s, #%zu]\n", w_name, ARM64_FRAME_REG, addr);
 				else
-					fprintf(out, "    ldrsh %s, [sp, #%zu]\n", x_name, addr);
+					fprintf(out, "    ldrsh %s, [%s, #%zu]\n", x_name, ARM64_FRAME_REG, addr);
 			}
 			else
-				fprintf(out, "    ldrh %s, [sp, #%zu]\n", w_name, addr);
+				fprintf(out, "    ldrh %s, [%s, #%zu]\n", w_name, ARM64_FRAME_REG, addr);
 		}
 		else
 		{
 			if (is_signed)
 			{
 				if (use_w)
-					fprintf(out, "    ldrsb %s, [sp, #%zu]\n", w_name, addr);
+					fprintf(out, "    ldrsb %s, [%s, #%zu]\n", w_name, ARM64_FRAME_REG, addr);
 				else
-					fprintf(out, "    ldrsb %s, [sp, #%zu]\n", x_name, addr);
+					fprintf(out, "    ldrsb %s, [%s, #%zu]\n", x_name, ARM64_FRAME_REG, addr);
 			}
 			else
-				fprintf(out, "    ldrb %s, [sp, #%zu]\n", w_name, addr);
+				fprintf(out, "    ldrb %s, [%s, #%zu]\n", w_name, ARM64_FRAME_REG, addr);
 		}
 		return true;
 	}
@@ -797,7 +796,7 @@ static bool arm64_materialize_fp(Arm64FunctionContext *ctx, Arm64Value *value, c
 	{
 		size_t offset = value->data.stack.offset;
 		size_t addr = arm64_frame_offset(ctx, offset);
-		fprintf(out, "    ldr %s, [sp, #%zu]\n", fp_reg, addr);
+		fprintf(out, "    ldr %s, [%s, #%zu]\n", fp_reg, ARM64_FRAME_REG, addr);
 		return true;
 	}
 	case ARM64_VALUE_REGISTER:
@@ -904,7 +903,7 @@ static bool arm64_spill_register_value(Arm64FunctionContext *ctx, Arm64Value *va
 			emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "arm64 spill does not support %zu-byte floating value", size_bytes);
 			return false;
 		}
-		fprintf(out, "    str %s, [sp, #%zu]\n", store_reg, addr);
+		fprintf(out, "    str %s, [%s, #%zu]\n", store_reg, ARM64_FRAME_REG, addr);
 	}
 	else
 	{
@@ -932,19 +931,19 @@ static bool arm64_spill_register_value(Arm64FunctionContext *ctx, Arm64Value *va
 				emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "arm64 spill requires 64-bit register");
 				return false;
 			}
-			fprintf(out, "    str %s, [sp, #%zu]\n", x_reg, addr);
+			fprintf(out, "    str %s, [%s, #%zu]\n", x_reg, ARM64_FRAME_REG, addr);
 		}
 		else if (size_bytes == 4)
 		{
-			fprintf(out, "    str %s, [sp, #%zu]\n", w_reg, addr);
+			fprintf(out, "    str %s, [%s, #%zu]\n", w_reg, ARM64_FRAME_REG, addr);
 		}
 		else if (size_bytes == 2)
 		{
-			fprintf(out, "    strh %s, [sp, #%zu]\n", w_reg, addr);
+			fprintf(out, "    strh %s, [%s, #%zu]\n", w_reg, ARM64_FRAME_REG, addr);
 		}
 		else
 		{
-			fprintf(out, "    strb %s, [sp, #%zu]\n", w_reg, addr);
+			fprintf(out, "    strb %s, [%s, #%zu]\n", w_reg, ARM64_FRAME_REG, addr);
 		}
 	}
 	value->kind = ARM64_VALUE_STACK_SLOT;
@@ -983,7 +982,7 @@ static bool arm64_force_stack_slot(Arm64FunctionContext *ctx, Arm64Value *value,
 		const char *fp_reg = (size_bytes == 4) ? "s15" : "d15";
 		if (!arm64_materialize_fp(ctx, value, fp_reg, value->type))
 			return false;
-		fprintf(out, "    str %s, [sp, #%zu]\n", fp_reg, addr);
+		fprintf(out, "    str %s, [%s, #%zu]\n", fp_reg, ARM64_FRAME_REG, addr);
 	}
 	else
 	{
@@ -995,13 +994,13 @@ static bool arm64_force_stack_slot(Arm64FunctionContext *ctx, Arm64Value *value,
 		if (!arm64_materialize_gp(ctx, value, reg, use_w))
 			return false;
 		if (size_bytes >= 8)
-			fprintf(out, "    str %s, [sp, #%zu]\n", x_reg, addr);
+			fprintf(out, "    str %s, [%s, #%zu]\n", x_reg, ARM64_FRAME_REG, addr);
 		else if (size_bytes == 4)
-			fprintf(out, "    str %s, [sp, #%zu]\n", w_reg, addr);
+			fprintf(out, "    str %s, [%s, #%zu]\n", w_reg, ARM64_FRAME_REG, addr);
 		else if (size_bytes == 2)
-			fprintf(out, "    strh %s, [sp, #%zu]\n", w_reg, addr);
+			fprintf(out, "    strh %s, [%s, #%zu]\n", w_reg, ARM64_FRAME_REG, addr);
 		else
-			fprintf(out, "    strb %s, [sp, #%zu]\n", w_reg, addr);
+			fprintf(out, "    strb %s, [%s, #%zu]\n", w_reg, ARM64_FRAME_REG, addr);
 	}
 	value->kind = ARM64_VALUE_STACK_SLOT;
 	value->data.stack.offset = offset;
@@ -1285,13 +1284,13 @@ static bool arm64_emit_store_local(Arm64FunctionContext *ctx, const CCInstructio
 		return false;
 	FILE *out = ctx->out;
 	if (size_bytes >= 8)
-		fprintf(out, "    str %s, [sp, #%zu]\n", reg, addr);
+		fprintf(out, "    str %s, [%s, #%zu]\n", reg, ARM64_FRAME_REG, addr);
 	else if (size_bytes == 4)
-		fprintf(out, "    str %s, [sp, #%zu]\n", reg, addr);
+		fprintf(out, "    str %s, [%s, #%zu]\n", reg, ARM64_FRAME_REG, addr);
 	else if (size_bytes == 2)
-		fprintf(out, "    strh %s, [sp, #%zu]\n", ARM64_SCRATCH_GP_REGS32[0], addr);
+		fprintf(out, "    strh %s, [%s, #%zu]\n", ARM64_SCRATCH_GP_REGS32[0], ARM64_FRAME_REG, addr);
 	else
-		fprintf(out, "    strb %s, [sp, #%zu]\n", ARM64_SCRATCH_GP_REGS32[0], addr);
+		fprintf(out, "    strb %s, [%s, #%zu]\n", ARM64_SCRATCH_GP_REGS32[0], ARM64_FRAME_REG, addr);
 	return true;
 }
 
@@ -2418,12 +2417,10 @@ static bool arm64_emit_ret(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	{
 		fprintf(ctx->out, "    mov w0, wzr\n");
 	}
-	if (ctx->dynamic_sp_offset > 0)
-	{
-		fprintf(ctx->out, "    add sp, sp, #%zu\n", ctx->dynamic_sp_offset);
-		ctx->dynamic_sp_offset = 0;
-	}
-	fprintf(ctx->out, "    mov sp, x29\n");
+	fprintf(ctx->out, "    mov sp, %s\n", ARM64_FRAME_REG);
+	if (ctx->frame_size > 0)
+		fprintf(ctx->out, "    add sp, sp, #%zu\n", ctx->frame_size);
+	fprintf(ctx->out, "    ldp %s, x28, [sp], #16\n", ARM64_FRAME_REG);
 	fprintf(ctx->out, "    ldp x29, x30, [sp], #16\n");
 	fprintf(ctx->out, "    ret\n");
 	ctx->saw_return = true;
@@ -2525,7 +2522,6 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	ctx->local_types = NULL;
 	ctx->frame_size = 0;
 	ctx->saw_return = false;
-	ctx->dynamic_sp_offset = 0;
 	ctx->stack_snapshots = NULL;
 	ctx->stack_snapshot_count = 0;
 	ctx->stack_snapshot_capacity = 0;
@@ -2603,8 +2599,10 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	fprintf(ctx->out, "%s:\n", fn_symbol ? fn_symbol : ctx->fn->name);
 	fprintf(ctx->out, "    stp x29, x30, [sp, #-16]!\n");
 	fprintf(ctx->out, "    mov x29, sp\n");
+	fprintf(ctx->out, "    stp %s, x28, [sp, #-16]!\n", ARM64_FRAME_REG);
 	if (ctx->frame_size > 0)
 		fprintf(ctx->out, "    sub sp, sp, #%zu\n", ctx->frame_size);
+	fprintf(ctx->out, "    mov %s, sp\n", ARM64_FRAME_REG);
 
 	size_t gp_param_index = 0;
 	size_t fp_param_index = 0;
@@ -2624,9 +2622,9 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 				goto fail;
 			}
 			if (size_bytes == 4)
-				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", ARM64_FP_REGS32[fp_param_index], addr);
+				fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_FP_REGS32[fp_param_index], ARM64_FRAME_REG, addr);
 			else
-				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", ARM64_FP_REGS[fp_param_index], addr);
+				fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_FP_REGS[fp_param_index], ARM64_FRAME_REG, addr);
 			fp_param_index++;
 			continue;
 		}
@@ -2637,13 +2635,13 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 			goto fail;
 		}
 		if (size_bytes == 1)
-			fprintf(ctx->out, "    strb %s, [sp, #%zu]\n", ARM64_GP_REGS32[gp_param_index], addr);
+			fprintf(ctx->out, "    strb %s, [%s, #%zu]\n", ARM64_GP_REGS32[gp_param_index], ARM64_FRAME_REG, addr);
 		else if (size_bytes == 2)
-			fprintf(ctx->out, "    strh %s, [sp, #%zu]\n", ARM64_GP_REGS32[gp_param_index], addr);
+			fprintf(ctx->out, "    strh %s, [%s, #%zu]\n", ARM64_GP_REGS32[gp_param_index], ARM64_FRAME_REG, addr);
 		else if (size_bytes == 4)
-			fprintf(ctx->out, "    str %s, [sp, #%zu]\n", ARM64_GP_REGS32[gp_param_index], addr);
+			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_GP_REGS32[gp_param_index], ARM64_FRAME_REG, addr);
 		else
-			fprintf(ctx->out, "    str %s, [sp, #%zu]\n", ARM64_GP_REGS64[gp_param_index], addr);
+			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_GP_REGS64[gp_param_index], ARM64_FRAME_REG, addr);
 		gp_param_index++;
 	}
 
@@ -2657,7 +2655,7 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 			for (size_t reg = 0; reg < gp_reg_count; ++reg)
 			{
 				size_t addr = arm64_frame_offset(ctx, base_offset + reg * 8);
-				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", ARM64_GP_REGS64[reg], addr);
+				fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_GP_REGS64[reg], ARM64_FRAME_REG, addr);
 			}
 			
 			// Spill Floating Point Registers (d0-d7)
@@ -2667,7 +2665,7 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 			for (size_t reg = 0; reg < fp_reg_count; ++reg)
 			{
 				size_t addr = arm64_frame_offset(ctx, fp_base_offset + reg * 8);
-				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", ARM64_FP_REGS[reg], addr);
+				fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_FP_REGS[reg], ARM64_FRAME_REG, addr);
 			}
 		}
 
@@ -2684,12 +2682,10 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 			bool use_w = (ctx->fn->return_type == CC_TYPE_I32 || ctx->fn->return_type == CC_TYPE_U32 || ctx->fn->return_type == CC_TYPE_I16 || ctx->fn->return_type == CC_TYPE_U16 || ctx->fn->return_type == CC_TYPE_I8 || ctx->fn->return_type == CC_TYPE_U8 || ctx->fn->return_type == CC_TYPE_I1);
 			fprintf(ctx->out, "    mov %s, %s\n", use_w ? "w0" : "x0", use_w ? "wzr" : "xzr");
 		}
-		if (ctx->dynamic_sp_offset > 0)
-		{
-			fprintf(ctx->out, "    add sp, sp, #%zu\n", ctx->dynamic_sp_offset);
-			ctx->dynamic_sp_offset = 0;
-		}
-		fprintf(ctx->out, "    mov sp, x29\n");
+		fprintf(ctx->out, "    mov sp, %s\n", ARM64_FRAME_REG);
+		if (ctx->frame_size > 0)
+			fprintf(ctx->out, "    add sp, sp, #%zu\n", ctx->frame_size);
+		fprintf(ctx->out, "    ldp %s, x28, [sp], #16\n", ARM64_FRAME_REG);
 		fprintf(ctx->out, "    ldp x29, x30, [sp], #16\n");
 		fprintf(ctx->out, "    ret\n");
 	}
@@ -2707,7 +2703,6 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	ctx->temp_base_offset = 0;
 	ctx->temp_area_size = 0;
 	ctx->temp_slot_stride = 0;
-	ctx->dynamic_sp_offset = 0;
 	arm64_clear_stack_snapshots(ctx);
 
 	return true;
@@ -2726,7 +2721,6 @@ fail:
 	ctx->temp_base_offset = 0;
 	ctx->temp_area_size = 0;
 	ctx->temp_slot_stride = 0;
-	ctx->dynamic_sp_offset = 0;
 	arm64_clear_stack_snapshots(ctx);
 	return false;
 }
