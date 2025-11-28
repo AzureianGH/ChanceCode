@@ -173,6 +173,18 @@ typedef struct
 
 typedef struct
 {
+    const CCFunction *fn;
+    char *alias;
+} X86FunctionAlias;
+
+typedef struct
+{
+    char *original;
+    char *alias;
+} X86LabelAlias;
+
+typedef struct
+{
     FILE *out;
     const CCModule *module;
     CCDiagnosticSink *sink;
@@ -181,6 +193,12 @@ typedef struct
     size_t string_counter;
     const X86Syntax *syntax;
     const X86ABIInfo *abi;
+    bool keep_debug_names;
+    size_t next_function_id;
+    size_t hidden_symbol_counter;
+    X86FunctionAlias *hidden_fn_aliases;
+    size_t hidden_fn_alias_count;
+    size_t hidden_fn_alias_capacity;
 } X86ModuleContext;
 
 typedef struct X86ParamInfo
@@ -213,6 +231,16 @@ typedef struct
     bool reg_r11_in_use;
     bool use_frame;
     bool terminated;
+    uint32_t current_loc_file;
+    uint32_t current_loc_line;
+    uint32_t current_loc_column;
+    size_t function_id;
+    const char *symbol_name;
+    bool obfuscate_labels;
+    X86LabelAlias *label_aliases;
+    size_t label_alias_count;
+    size_t label_alias_capacity;
+    size_t next_label_id;
 } X86FunctionContext;
 
 static size_t align_to(size_t value, size_t alignment)
@@ -356,6 +384,17 @@ static bool equals_ignore_case(const char *a, const char *b)
     return *a == '\0' && *b == '\0';
 }
 
+static bool option_is_enabled(const char *value)
+{
+    if (!value || *value == '\0')
+        return false;
+    if (strcmp(value, "0") == 0)
+        return false;
+    if (equals_ignore_case(value, "false") || equals_ignore_case(value, "off"))
+        return false;
+    return true;
+}
+
 static bool module_has_function(const CCModule *module, const char *name)
 {
     if (!module || !name)
@@ -366,6 +405,18 @@ static bool module_has_function(const CCModule *module, const char *name)
             return true;
     }
     return false;
+}
+
+static const CCFunction *module_find_function(const CCModule *module, const char *name)
+{
+    if (!module || !name)
+        return NULL;
+    for (size_t i = 0; i < module->function_count; ++i)
+    {
+        if (module->functions[i].name && strcmp(module->functions[i].name, name) == 0)
+            return &module->functions[i];
+    }
+    return NULL;
 }
 
 static bool module_symbol_is_noreturn(const CCModule *module, const char *name)
@@ -437,15 +488,170 @@ static bool module_add_string_literal(X86ModuleContext *ctx, const char *label, 
     return string_table_add(&ctx->strings, label, data, length);
 }
 
+static char *x86_strdup(const char *src)
+{
+    if (!src)
+        return NULL;
+    size_t len = strlen(src);
+    char *copy = (char *)malloc(len + 1);
+    if (!copy)
+        return NULL;
+    memcpy(copy, src, len + 1);
+    return copy;
+}
+
+static void hidden_function_aliases_destroy(X86ModuleContext *ctx)
+{
+    if (!ctx || !ctx->hidden_fn_aliases)
+        return;
+    for (size_t i = 0; i < ctx->hidden_fn_alias_count; ++i)
+    {
+        free(ctx->hidden_fn_aliases[i].alias);
+        ctx->hidden_fn_aliases[i].alias = NULL;
+    }
+    free(ctx->hidden_fn_aliases);
+    ctx->hidden_fn_aliases = NULL;
+    ctx->hidden_fn_alias_count = 0;
+    ctx->hidden_fn_alias_capacity = 0;
+}
+
+static bool ensure_hidden_alias_capacity(X86ModuleContext *ctx, size_t desired)
+{
+    if (ctx->hidden_fn_alias_capacity >= desired)
+        return true;
+    size_t new_capacity = ctx->hidden_fn_alias_capacity ? ctx->hidden_fn_alias_capacity * 2 : 4;
+    while (new_capacity < desired)
+        new_capacity *= 2;
+    X86FunctionAlias *grown = (X86FunctionAlias *)realloc(ctx->hidden_fn_aliases, new_capacity * sizeof(X86FunctionAlias));
+    if (!grown)
+        return false;
+    for (size_t i = ctx->hidden_fn_alias_capacity; i < new_capacity; ++i)
+    {
+        grown[i].fn = NULL;
+        grown[i].alias = NULL;
+    }
+    ctx->hidden_fn_aliases = grown;
+    ctx->hidden_fn_alias_capacity = new_capacity;
+    return true;
+}
+
+static const char *module_function_symbol(X86ModuleContext *ctx, const CCFunction *fn)
+{
+    if (!ctx || !fn)
+        return fn ? fn->name : NULL;
+    if (ctx->keep_debug_names || !fn->is_hidden)
+        return fn->name;
+
+    for (size_t i = 0; i < ctx->hidden_fn_alias_count; ++i)
+    {
+        if (ctx->hidden_fn_aliases[i].fn == fn)
+            return ctx->hidden_fn_aliases[i].alias;
+    }
+
+    if (!ensure_hidden_alias_capacity(ctx, ctx->hidden_fn_alias_count + 1))
+        return fn->name;
+
+    size_t id = ++ctx->hidden_symbol_counter;
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "__cc_hidden_fn%zu", id);
+    char *alias = x86_strdup(buffer);
+    if (!alias)
+        return fn->name;
+    ctx->hidden_fn_aliases[ctx->hidden_fn_alias_count].fn = fn;
+    ctx->hidden_fn_aliases[ctx->hidden_fn_alias_count].alias = alias;
+    ctx->hidden_fn_alias_count++;
+    return alias;
+}
+
+static const char *module_symbol_alias(X86ModuleContext *ctx, const char *symbol)
+{
+    if (!ctx || !symbol)
+        return symbol;
+    const CCFunction *fn = module_find_function(ctx->module, symbol);
+    if (!fn)
+        return symbol;
+    const char *mapped = module_function_symbol(ctx, fn);
+    return mapped ? mapped : symbol;
+}
+
+static void label_aliases_destroy(X86FunctionContext *ctx)
+{
+    if (!ctx || !ctx->label_aliases)
+        return;
+    for (size_t i = 0; i < ctx->label_alias_count; ++i)
+    {
+        free(ctx->label_aliases[i].original);
+        free(ctx->label_aliases[i].alias);
+        ctx->label_aliases[i].original = NULL;
+        ctx->label_aliases[i].alias = NULL;
+    }
+    free(ctx->label_aliases);
+    ctx->label_aliases = NULL;
+    ctx->label_alias_capacity = 0;
+    ctx->label_alias_count = 0;
+}
+
+static bool ensure_label_alias_capacity(X86FunctionContext *ctx, size_t desired)
+{
+    if (ctx->label_alias_capacity >= desired)
+        return true;
+    size_t new_capacity = ctx->label_alias_capacity ? ctx->label_alias_capacity * 2 : 8;
+    while (new_capacity < desired)
+        new_capacity *= 2;
+    X86LabelAlias *grown = (X86LabelAlias *)realloc(ctx->label_aliases, new_capacity * sizeof(X86LabelAlias));
+    if (!grown)
+        return false;
+    for (size_t i = ctx->label_alias_capacity; i < new_capacity; ++i)
+    {
+        grown[i].original = NULL;
+        grown[i].alias = NULL;
+    }
+    ctx->label_aliases = grown;
+    ctx->label_alias_capacity = new_capacity;
+    return true;
+}
+
+static const char *x86_alias_label(X86FunctionContext *ctx, const char *original)
+{
+    if (!ctx || !original)
+        return original;
+    if (!ctx->obfuscate_labels)
+        return original;
+    for (size_t i = 0; i < ctx->label_alias_count; ++i)
+    {
+        if (ctx->label_aliases[i].original && strcmp(ctx->label_aliases[i].original, original) == 0)
+            return ctx->label_aliases[i].alias;
+    }
+    if (!ensure_label_alias_capacity(ctx, ctx->label_alias_count + 1))
+        return original;
+    char buffer[64];
+    snprintf(buffer, sizeof(buffer), "__cc_label_f%zu_%zu", ctx->function_id, ctx->next_label_id++);
+    char *alias = x86_strdup(buffer);
+    char *orig_copy = x86_strdup(original);
+    if (!alias || !orig_copy)
+    {
+        free(alias);
+        free(orig_copy);
+        return original;
+    }
+    ctx->label_aliases[ctx->label_alias_count].original = orig_copy;
+    ctx->label_aliases[ctx->label_alias_count].alias = alias;
+    ctx->label_alias_count++;
+    return alias;
+}
+
 static const char *module_intern_string_literal(X86ModuleContext *ctx, const CCFunction *fn, const CCInstruction *ins)
 {
     if (!ctx || !fn || !ins)
         return NULL;
     char label[256];
+    const char *fn_symbol = module_function_symbol(ctx, fn);
+    if (!fn_symbol)
+        fn_symbol = fn->name;
     if (ins->data.const_string.label_hint && ins->data.const_string.label_hint[0] != '\0')
-        snprintf(label, sizeof(label), "%s__%s", fn->name, ins->data.const_string.label_hint);
+        snprintf(label, sizeof(label), "%s__%s", fn_symbol, ins->data.const_string.label_hint);
     else
-        snprintf(label, sizeof(label), "%s__str%zu", fn->name, ctx->string_counter++);
+        snprintf(label, sizeof(label), "%s__str%zu", fn_symbol, ctx->string_counter++);
     if (!module_add_string_literal(ctx, label, ins->data.const_string.bytes, ins->data.const_string.length))
         return NULL;
     return ctx->strings.items[ctx->strings.count - 1].label;
@@ -808,6 +1014,7 @@ static void function_context_free(X86FunctionContext *ctx)
     free(ctx->param_offsets);
     free(ctx->param_info);
     free(ctx->local_offsets);
+    label_aliases_destroy(ctx);
     ctx->stack = NULL;
     ctx->param_offsets = NULL;
     ctx->param_info = NULL;
@@ -837,6 +1044,23 @@ static void emit_zero_extend(FILE *out, CCValueType type)
     default:
         break;
     }
+}
+
+static void emit_debug_location(X86FunctionContext *ctx, const CCInstruction *ins)
+{
+    if (!ctx || !ins || !ctx->out || !ctx->syntax)
+        return;
+    if (ctx->syntax->flavor != X86_ASM_GAS)
+        return;
+    if (ins->debug_file == 0 || ins->debug_line == 0)
+        return;
+    uint32_t column = ins->debug_column ? ins->debug_column : 1;
+    if (ctx->current_loc_file == ins->debug_file && ctx->current_loc_line == ins->debug_line && ctx->current_loc_column == column)
+        return;
+    ctx->current_loc_file = ins->debug_file;
+    ctx->current_loc_line = ins->debug_line;
+    ctx->current_loc_column = column;
+    fprintf(ctx->out, "    .loc %u %u %u\n", ctx->current_loc_file, ctx->current_loc_line, ctx->current_loc_column);
 }
 
 static void emit_sign_extend(FILE *out, CCValueType type)
@@ -1979,8 +2203,17 @@ static bool emit_branch(X86FunctionContext *ctx, const CCInstruction *ins)
         return false;
     }
     fprintf(ctx->out, "    cmp rax, 0\n");
-    fprintf(ctx->out, "    jne %s__%s\n", ctx->fn->name, ins->data.branch.true_target);
-    fprintf(ctx->out, "    jmp %s__%s\n", ctx->fn->name, ins->data.branch.false_target);
+    if (ctx->obfuscate_labels)
+    {
+        fprintf(ctx->out, "    jne %s\n", x86_alias_label(ctx, ins->data.branch.true_target));
+        fprintf(ctx->out, "    jmp %s\n", x86_alias_label(ctx, ins->data.branch.false_target));
+    }
+    else
+    {
+        const char *fn_symbol = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
+        fprintf(ctx->out, "    jne %s__%s\n", fn_symbol, ins->data.branch.true_target);
+        fprintf(ctx->out, "    jmp %s__%s\n", fn_symbol, ins->data.branch.false_target);
+    }
     return true;
 }
 
@@ -2224,7 +2457,8 @@ static bool emit_call(X86FunctionContext *ctx, const CCInstruction *ins)
     }
     else
     {
-        fprintf(ctx->out, "    call %s\n", ins->data.call.symbol);
+        const char *target = module_symbol_alias(ctx->module, ins->data.call.symbol);
+        fprintf(ctx->out, "    call %s\n", target ? target : ins->data.call.symbol);
     }
 
     if (ctx->stack_size >= arg_count)
@@ -2293,6 +2527,8 @@ static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
         return true;
     }
 
+    emit_debug_location(ctx, ins);
+
     if (ins->kind == CC_INSTR_LABEL)
         ctx->terminated = false;
 
@@ -2344,10 +2580,22 @@ static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
     case CC_INSTR_DROP:
         return emit_drop(ctx, ins);
     case CC_INSTR_LABEL:
-        fprintf(ctx->out, "%s__%s:\n", ctx->fn->name, ins->data.label.name);
+        if (ctx->obfuscate_labels)
+            fprintf(ctx->out, "%s:\n", x86_alias_label(ctx, ins->data.label.name));
+        else
+        {
+            const char *fn_symbol = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
+            fprintf(ctx->out, "%s__%s:\n", fn_symbol, ins->data.label.name);
+        }
         return true;
     case CC_INSTR_JUMP:
-        fprintf(ctx->out, "    jmp %s__%s\n", ctx->fn->name, ins->data.jump.target);
+        if (ctx->obfuscate_labels)
+            fprintf(ctx->out, "    jmp %s\n", x86_alias_label(ctx, ins->data.jump.target));
+        else
+        {
+            const char *fn_symbol = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
+            fprintf(ctx->out, "    jmp %s__%s\n", fn_symbol, ins->data.jump.target);
+        }
         return true;
     case CC_INSTR_BRANCH:
         return emit_branch(ctx, ins);
@@ -2367,8 +2615,13 @@ static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
 
 static void emit_function_prologue(X86FunctionContext *ctx)
 {
-    fprintf(ctx->out, "%s %s\n", ctx->syntax->global_directive, ctx->fn->name);
-    fprintf(ctx->out, "%s:\n", ctx->fn->name);
+    const char *symbol = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
+    bool emit_global = true;
+    if (ctx->module && !ctx->module->keep_debug_names && ctx->fn && ctx->fn->is_hidden)
+        emit_global = false;
+    if (emit_global)
+        fprintf(ctx->out, "%s %s\n", ctx->syntax->global_directive, symbol);
+    fprintf(ctx->out, "%s:\n", symbol);
     if (!ctx->use_frame)
         return;
     fprintf(ctx->out, "    push rbp\n");
@@ -2466,6 +2719,11 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
     ctx.sink = module_ctx->sink;
     ctx.syntax = module_ctx->syntax;
     ctx.abi = module_ctx->abi;
+    ctx.symbol_name = module_function_symbol(module_ctx, fn);
+    if (!ctx.symbol_name)
+        ctx.symbol_name = fn->name;
+    ctx.function_id = module_ctx->next_function_id++;
+    ctx.obfuscate_labels = !module_ctx->keep_debug_names;
 
     if (!analyze_param_usage(&ctx))
     {
@@ -2650,6 +2908,25 @@ static void emit_externs(const X86ModuleContext *ctx)
         fprintf(ctx->out, "\n");
 }
 
+static void emit_debug_files(const X86ModuleContext *ctx)
+{
+    if (!ctx || !ctx->module || !ctx->syntax)
+        return;
+    if (ctx->syntax->flavor != X86_ASM_GAS)
+        return;
+    size_t file_count = ctx->module->debug_file_count;
+    if (file_count == 0)
+        return;
+    for (size_t i = 0; i < file_count; ++i)
+    {
+        const char *path = cc_module_get_debug_file(ctx->module, (uint32_t)(i + 1));
+        if (!path)
+            continue;
+        fprintf(ctx->out, ".file %zu \"%s\"\n", i + 1, path);
+    }
+    fprintf(ctx->out, "\n");
+}
+
 static bool emit_module(const CCBackend *backend,
                         const CCModule *module,
                         const CCBackendOptions *options,
@@ -2678,6 +2955,8 @@ static bool emit_module(const CCBackend *backend,
     ctx.module = module;
     ctx.sink = sink;
     ctx.syntax = backend && backend->userdata ? (const X86Syntax *)backend->userdata : &kNasmSyntax;
+    const char *debug_opt = backend_option_get(options, "debug");
+    ctx.keep_debug_names = option_is_enabled(debug_opt);
     const char *target_os_opt = backend_option_get(options, "target-os");
     if (target_os_opt)
     {
@@ -2690,6 +2969,7 @@ static bool emit_module(const CCBackend *backend,
             emit_diag(sink, CC_DIAG_ERROR, 0, "unknown target-os '%s' (expected windows or linux)", target_os_opt);
             if (out != stdout)
                 fclose(out);
+            hidden_function_aliases_destroy(&ctx);
             return false;
         }
     }
@@ -2708,6 +2988,7 @@ static bool emit_module(const CCBackend *backend,
             fclose(out);
         string_table_destroy(&ctx.strings);
         string_set_destroy(&ctx.externs);
+        hidden_function_aliases_destroy(&ctx);
         return false;
     }
 
@@ -2717,6 +2998,7 @@ static bool emit_module(const CCBackend *backend,
         fprintf(out, ".intel_syntax noprefix\n\n");
 
     emit_externs(&ctx);
+    emit_debug_files(&ctx);
 
     for (size_t i = 0; i < module->global_count; ++i)
         emit_global_data(&ctx, &module->globals[i]);
@@ -2731,6 +3013,7 @@ static bool emit_module(const CCBackend *backend,
                 fclose(out);
             string_table_destroy(&ctx.strings);
             string_set_destroy(&ctx.externs);
+            hidden_function_aliases_destroy(&ctx);
             return false;
         }
     }
@@ -2744,6 +3027,7 @@ static bool emit_module(const CCBackend *backend,
         fclose(out);
     string_table_destroy(&ctx.strings);
     string_set_destroy(&ctx.externs);
+    hidden_function_aliases_destroy(&ctx);
     return true;
 }
 

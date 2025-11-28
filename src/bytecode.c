@@ -158,6 +158,9 @@ void cc_module_init(CCModule *module, uint32_t version)
     module->functions = NULL;
     module->function_count = 0;
     module->function_capacity = 0;
+    module->debug_files = NULL;
+    module->debug_file_count = 0;
+    module->debug_file_capacity = 0;
 }
 
 void cc_module_free(CCModule *module)
@@ -190,6 +193,13 @@ void cc_module_free(CCModule *module)
         for (size_t i = 0; i < module->function_count; ++i)
             cc_function_free(&module->functions[i]);
         free(module->functions);
+    }
+
+    if (module->debug_files)
+    {
+        for (size_t i = 0; i < module->debug_file_count; ++i)
+            free(module->debug_files[i]);
+        free(module->debug_files);
     }
 
     memset(module, 0, sizeof(*module));
@@ -255,6 +265,27 @@ static bool cc_module_reserve_functions(CCModule *module, size_t desired)
 
     module->functions = new_data;
     module->function_capacity = new_capacity;
+    return true;
+}
+
+static bool cc_module_reserve_debug_files(CCModule *module, size_t desired)
+{
+    if (module->debug_file_capacity >= desired)
+        return true;
+
+    size_t new_capacity = module->debug_file_capacity ? module->debug_file_capacity * 2 : 4;
+    while (new_capacity < desired)
+        new_capacity *= 2;
+
+    char **new_files = (char **)realloc(module->debug_files, new_capacity * sizeof(char *));
+    if (!new_files)
+        return false;
+
+    for (size_t i = module->debug_file_capacity; i < new_capacity; ++i)
+        new_files[i] = NULL;
+
+    module->debug_files = new_files;
+    module->debug_file_capacity = new_capacity;
     return true;
 }
 
@@ -354,6 +385,37 @@ CCFunction *cc_module_add_function(CCModule *module, const char *name)
     fn->literal_lines = NULL;
     fn->literal_count = 0;
     return fn;
+}
+
+bool cc_module_set_debug_file(CCModule *module, uint32_t id, const char *path)
+{
+    if (!module || id == 0 || !path || path[0] == '\0')
+        return false;
+
+    size_t index = (size_t)id - 1;
+    if (!cc_module_reserve_debug_files(module, index + 1))
+        return false;
+
+    char *copy = cc_strdup(path);
+    if (!copy)
+        return false;
+
+    if (module->debug_files[index])
+        free(module->debug_files[index]);
+    module->debug_files[index] = copy;
+    if (module->debug_file_count <= index)
+        module->debug_file_count = index + 1;
+    return true;
+}
+
+const char *cc_module_get_debug_file(const CCModule *module, uint32_t id)
+{
+    if (!module || id == 0)
+        return NULL;
+    size_t index = (size_t)id - 1;
+    if (index >= module->debug_file_count)
+        return NULL;
+    return module->debug_files ? module->debug_files[index] : NULL;
 }
 
 bool cc_function_set_param_types(CCFunction *function, const CCValueType *types, size_t count)

@@ -3,6 +3,7 @@
 #include "cc/diagnostics.h"
 
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -10,6 +11,10 @@
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #define ARM64_STACK_ALIGNMENT 16
 
@@ -43,6 +48,18 @@ typedef struct
 	size_t count;
 	size_t capacity;
 } Arm64SymbolSet;
+
+typedef struct
+{
+	const CCFunction *fn;
+	char *alias;
+} Arm64FunctionAlias;
+
+typedef struct
+{
+	char *original;
+	char *alias;
+} Arm64LabelAlias;
 
 typedef struct
 {
@@ -93,6 +110,12 @@ typedef struct
 	size_t vararg_capacity;
 	bool vararg_cache_loaded;
 	size_t string_counter;
+	bool keep_debug_names;
+	size_t next_function_id;
+	size_t hidden_symbol_counter;
+	Arm64FunctionAlias *hidden_fn_aliases;
+	size_t hidden_fn_alias_count;
+	size_t hidden_fn_alias_capacity;
 } Arm64ModuleContext;
 
 typedef struct
@@ -127,6 +150,16 @@ typedef struct
 	Arm64StackSnapshot *stack_snapshots;
 	size_t stack_snapshot_count;
 	size_t stack_snapshot_capacity;
+	uint32_t current_loc_file;
+	uint32_t current_loc_line;
+	uint32_t current_loc_column;
+	size_t function_id;
+	const char *symbol_name;
+	bool obfuscate_labels;
+	Arm64LabelAlias *label_aliases;
+	size_t label_alias_count;
+	size_t label_alias_capacity;
+	size_t next_label_id;
 } Arm64FunctionContext;
 
 static void arm64_vararg_cache_load(Arm64ModuleContext *ctx);
@@ -149,6 +182,56 @@ typedef struct
 
 static bool arm64_spill_register_value(Arm64FunctionContext *ctx, Arm64Value *value, size_t stack_index);
 static bool arm64_force_stack_slot(Arm64FunctionContext *ctx, Arm64Value *value, size_t stack_index);
+
+static void arm64_write_quoted(FILE *out, const char *text)
+{
+	if (!out)
+		return;
+	fputc('"', out);
+	if (text)
+	{
+		for (const char *p = text; *p; ++p)
+		{
+			if (*p == '"' || *p == '\\')
+				fputc('\\', out);
+			fputc(*p, out);
+		}
+	}
+	fputc('"', out);
+}
+
+static void arm64_split_path(const char *path, char *dir, size_t dirsz,
+							 char *file, size_t filesz)
+{
+	if (dir && dirsz)
+		dir[0] = '\0';
+	if (file && filesz)
+		file[0] = '\0';
+	if (!path || !*path)
+		return;
+	const char *last_sep = NULL;
+	for (const char *p = path; *p; ++p)
+	{
+		if (*p == '/' || *p == '\\')
+			last_sep = p;
+	}
+	if (!last_sep)
+	{
+		if (file && filesz)
+			snprintf(file, filesz, "%s", path);
+		return;
+	}
+	if (dir && dirsz)
+	{
+		size_t len = (size_t)(last_sep - path);
+		if (len >= dirsz)
+			len = dirsz - 1;
+		memcpy(dir, path, len);
+		dir[len] = '\0';
+	}
+	if (file && filesz)
+		snprintf(file, filesz, "%s", last_sep + 1);
+}
 
 static void emit_diag(CCDiagnosticSink *sink, CCDiagnosticSeverity severity, size_t line, const char *fmt, ...)
 {
@@ -178,6 +261,19 @@ static bool module_has_function(const CCModule *module, const char *name)
 			return true;
 	}
 	return false;
+}
+
+static const CCFunction *module_find_function(const CCModule *module, const char *name)
+{
+	if (!module || !name)
+		return NULL;
+	for (size_t i = 0; i < module->function_count; ++i)
+	{
+		const CCFunction *fn = &module->functions[i];
+		if (fn->name && strcmp(fn->name, name) == 0)
+			return fn;
+	}
+	return NULL;
 }
 
 static size_t align_up_size(size_t value, size_t alignment)
@@ -337,6 +433,148 @@ static char *arm64_strdup(const char *src)
 	return copy;
 }
 
+static void hidden_function_aliases_destroy(Arm64ModuleContext *ctx)
+{
+	if (!ctx || !ctx->hidden_fn_aliases)
+		return;
+	for (size_t i = 0; i < ctx->hidden_fn_alias_count; ++i)
+	{
+		free(ctx->hidden_fn_aliases[i].alias);
+		ctx->hidden_fn_aliases[i].alias = NULL;
+		ctx->hidden_fn_aliases[i].fn = NULL;
+	}
+	free(ctx->hidden_fn_aliases);
+	ctx->hidden_fn_aliases = NULL;
+	ctx->hidden_fn_alias_count = 0;
+	ctx->hidden_fn_alias_capacity = 0;
+}
+
+static bool arm64_ensure_hidden_alias_capacity(Arm64ModuleContext *ctx, size_t desired)
+{
+	if (!ctx)
+		return false;
+	if (ctx->hidden_fn_alias_capacity >= desired)
+		return true;
+	size_t new_capacity = ctx->hidden_fn_alias_capacity ? ctx->hidden_fn_alias_capacity * 2 : 4;
+	while (new_capacity < desired)
+		new_capacity *= 2;
+	Arm64FunctionAlias *grown = (Arm64FunctionAlias *)realloc(ctx->hidden_fn_aliases, new_capacity * sizeof(Arm64FunctionAlias));
+	if (!grown)
+		return false;
+	for (size_t i = ctx->hidden_fn_alias_capacity; i < new_capacity; ++i)
+	{
+		grown[i].fn = NULL;
+		grown[i].alias = NULL;
+	}
+	ctx->hidden_fn_aliases = grown;
+	ctx->hidden_fn_alias_capacity = new_capacity;
+	return true;
+}
+
+static const char *arm64_module_function_symbol(Arm64ModuleContext *ctx, const CCFunction *fn)
+{
+	if (!ctx || !fn)
+		return fn ? fn->name : NULL;
+	if (ctx->keep_debug_names || !fn->is_hidden)
+		return fn->name;
+	for (size_t i = 0; i < ctx->hidden_fn_alias_count; ++i)
+	{
+		if (ctx->hidden_fn_aliases[i].fn == fn)
+			return ctx->hidden_fn_aliases[i].alias;
+	}
+	if (!arm64_ensure_hidden_alias_capacity(ctx, ctx->hidden_fn_alias_count + 1))
+		return fn->name;
+	size_t id = ++ctx->hidden_symbol_counter;
+	char buffer[64];
+	snprintf(buffer, sizeof(buffer), "__cc_hidden_fn%zu", id);
+	char *alias = arm64_strdup(buffer);
+	if (!alias)
+		return fn->name;
+	ctx->hidden_fn_aliases[ctx->hidden_fn_alias_count].fn = fn;
+	ctx->hidden_fn_aliases[ctx->hidden_fn_alias_count].alias = alias;
+	ctx->hidden_fn_alias_count++;
+	return alias;
+}
+
+static const char *arm64_module_symbol_alias(Arm64ModuleContext *ctx, const char *symbol)
+{
+	if (!ctx || !symbol)
+		return symbol;
+	const CCFunction *fn = module_find_function(ctx->module, symbol);
+	if (!fn)
+		return symbol;
+	const char *mapped = arm64_module_function_symbol(ctx, fn);
+	return mapped ? mapped : symbol;
+}
+
+static void arm64_label_aliases_destroy(Arm64FunctionContext *ctx)
+{
+	if (!ctx || !ctx->label_aliases)
+		return;
+	for (size_t i = 0; i < ctx->label_alias_count; ++i)
+	{
+		free(ctx->label_aliases[i].original);
+		free(ctx->label_aliases[i].alias);
+		ctx->label_aliases[i].original = NULL;
+		ctx->label_aliases[i].alias = NULL;
+	}
+	free(ctx->label_aliases);
+	ctx->label_aliases = NULL;
+	ctx->label_alias_count = 0;
+	ctx->label_alias_capacity = 0;
+}
+
+static bool arm64_ensure_label_alias_capacity(Arm64FunctionContext *ctx, size_t desired)
+{
+	if (!ctx)
+		return false;
+	if (ctx->label_alias_capacity >= desired)
+		return true;
+	size_t new_capacity = ctx->label_alias_capacity ? ctx->label_alias_capacity * 2 : 8;
+	while (new_capacity < desired)
+		new_capacity *= 2;
+	Arm64LabelAlias *grown = (Arm64LabelAlias *)realloc(ctx->label_aliases, new_capacity * sizeof(Arm64LabelAlias));
+	if (!grown)
+		return false;
+	for (size_t i = ctx->label_alias_capacity; i < new_capacity; ++i)
+	{
+		grown[i].original = NULL;
+		grown[i].alias = NULL;
+	}
+	ctx->label_aliases = grown;
+	ctx->label_alias_capacity = new_capacity;
+	return true;
+}
+
+static const char *arm64_alias_label(Arm64FunctionContext *ctx, const char *original)
+{
+	if (!ctx || !original)
+		return original;
+	if (!ctx->obfuscate_labels)
+		return original;
+	for (size_t i = 0; i < ctx->label_alias_count; ++i)
+	{
+		if (ctx->label_aliases[i].original && strcmp(ctx->label_aliases[i].original, original) == 0)
+			return ctx->label_aliases[i].alias;
+	}
+	if (!arm64_ensure_label_alias_capacity(ctx, ctx->label_alias_count + 1))
+		return original;
+	char buffer[64];
+	snprintf(buffer, sizeof(buffer), "__cc_label_f%zu_%zu", ctx->function_id, ctx->next_label_id++);
+	char *alias = arm64_strdup(buffer);
+	char *original_copy = arm64_strdup(original);
+	if (!alias || !original_copy)
+	{
+		free(alias);
+		free(original_copy);
+		return original;
+	}
+	ctx->label_aliases[ctx->label_alias_count].original = original_copy;
+	ctx->label_aliases[ctx->label_alias_count].alias = alias;
+	ctx->label_alias_count++;
+	return alias;
+}
+
 static bool equals_ignore_case(const char *a, const char *b)
 {
 	if (!a || !b)
@@ -349,6 +587,29 @@ static bool equals_ignore_case(const char *a, const char *b)
 			return false;
 	}
 	return *a == '\0' && *b == '\0';
+}
+
+static const char *backend_option_get(const CCBackendOptions *options, const char *key)
+{
+	if (!options || !key)
+		return NULL;
+	for (size_t i = 0; i < options->option_count; ++i)
+	{
+		if (strcmp(options->options[i].key, key) == 0)
+			return options->options[i].value;
+	}
+	return NULL;
+}
+
+static bool option_is_enabled(const char *value)
+{
+	if (!value || *value == '\0')
+		return false;
+	if (strcmp(value, "0") == 0)
+		return false;
+	if (equals_ignore_case(value, "false") || equals_ignore_case(value, "off"))
+		return false;
+	return true;
 }
 
 static bool string_table_reserve(Arm64StringTable *table, size_t desired)
@@ -577,11 +838,16 @@ static void arm64_emit_symbol_address(FILE *out, const char *symbol, const char 
 	fprintf(out, "    add %s, %s, %s@PAGEOFF\n", dst_reg, dst_reg, label);
 }
 
-static const char *arm64_local_label_name(const CCFunction *fn, const char *suffix, char *buffer, size_t buffer_size)
+static const char *arm64_local_label_name(Arm64FunctionContext *ctx, const char *suffix, char *buffer, size_t buffer_size)
 {
-	if (!fn || !fn->name || !suffix || !buffer || buffer_size == 0)
+	if (!ctx || !ctx->fn || !suffix)
 		return NULL;
-	snprintf(buffer, buffer_size, "%s__%s", fn->name, suffix);
+	if (ctx->obfuscate_labels)
+		return arm64_alias_label(ctx, suffix);
+	const char *symbol = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
+	if (!symbol || !buffer || buffer_size == 0)
+		return NULL;
+	snprintf(buffer, buffer_size, "%s__%s", symbol, suffix);
 	return buffer;
 }
 
@@ -1156,21 +1422,24 @@ static bool arm64_push_const(Arm64FunctionContext *ctx, const CCInstruction *ins
 	return function_stack_push(ctx, value);
 }
 
-static const char *arm64_intern_string(Arm64ModuleContext *module, const CCFunction *fn, const CCInstruction *ins)
+static const char *arm64_intern_string(Arm64FunctionContext *ctx, const CCInstruction *ins)
 {
-	char label[256];
-	if (ins->data.const_string.label_hint && ins->data.const_string.label_hint[0])
-		snprintf(label, sizeof(label), "_%s__%s", fn->name, ins->data.const_string.label_hint);
-	else
-		snprintf(label, sizeof(label), "L_str%zu", module->string_counter++);
-	if (!string_table_add(&module->strings, label, ins->data.const_string.bytes, ins->data.const_string.length))
+	if (!ctx || !ctx->module)
 		return NULL;
-	return module->strings.items[module->strings.count - 1].label;
+	char label[256];
+	const char *fn_symbol = ctx->symbol_name ? ctx->symbol_name : (ctx->fn ? ctx->fn->name : NULL);
+	if (ins->data.const_string.label_hint && ins->data.const_string.label_hint[0] && fn_symbol && *fn_symbol)
+		snprintf(label, sizeof(label), "_%s__%s", fn_symbol, ins->data.const_string.label_hint);
+	else
+		snprintf(label, sizeof(label), "L_str%zu", ctx->module->string_counter++);
+	if (!string_table_add(&ctx->module->strings, label, ins->data.const_string.bytes, ins->data.const_string.length))
+		return NULL;
+	return ctx->module->strings.items[ctx->module->strings.count - 1].label;
 }
 
 static bool arm64_push_const_string(Arm64FunctionContext *ctx, const CCInstruction *ins)
 {
-	const char *label = arm64_intern_string(ctx->module, ctx->fn, ins);
+	const char *label = arm64_intern_string(ctx, ins);
 	if (!label)
 		return false;
 	Arm64Value value;
@@ -1230,7 +1499,10 @@ static bool arm64_emit_load_global(Arm64FunctionContext *ctx, const CCInstructio
 		return false;
 	FILE *out = ctx->out;
 	const char *addr_reg = ARM64_SCRATCH_GP_REGS64[0];
-	arm64_emit_symbol_address(out, ins->data.global.symbol, addr_reg);
+	const char *symbol = ins->data.global.symbol;
+	if (ctx->module && module_has_function(ctx->module->module, symbol))
+		symbol = arm64_module_symbol_alias(ctx->module, symbol);
+	arm64_emit_symbol_address(out, symbol, addr_reg);
 	CCValueType type = ins->data.global.type;
 	Arm64Value result;
 	memset(&result, 0, sizeof(result));
@@ -1319,7 +1591,10 @@ static bool arm64_emit_store_global(Arm64FunctionContext *ctx, const CCInstructi
 		return false;
 	FILE *out = ctx->out;
 	const char *addr_reg = ARM64_SCRATCH_GP_REGS64[0];
-	arm64_emit_symbol_address(out, ins->data.global.symbol, addr_reg);
+	const char *symbol = ins->data.global.symbol;
+	if (ctx->module && module_has_function(ctx->module->module, symbol))
+		symbol = arm64_module_symbol_alias(ctx->module, symbol);
+	arm64_emit_symbol_address(out, symbol, addr_reg);
 	CCValueType type = ins->data.global.type;
 	if (cc_value_type_is_float(type))
 	{
@@ -1353,7 +1628,10 @@ static bool arm64_emit_addr_global(Arm64FunctionContext *ctx, const CCInstructio
 		return false;
 	FILE *out = ctx->out;
 	const char *dst_reg = ARM64_SCRATCH_GP_REGS64[0];
-	arm64_emit_symbol_address(out, ins->data.global.symbol, dst_reg);
+	const char *symbol = ins->data.global.symbol;
+	if (ctx->module && module_has_function(ctx->module->module, symbol))
+		symbol = arm64_module_symbol_alias(ctx->module, symbol);
+	arm64_emit_symbol_address(out, symbol, dst_reg);
 	Arm64Value value;
 	memset(&value, 0, sizeof(value));
 	value.kind = ARM64_VALUE_REGISTER;
@@ -1371,7 +1649,7 @@ static bool arm64_emit_label(Arm64FunctionContext *ctx, const CCInstruction *ins
 	if (!arm64_handle_label_entry(ctx, ins->line, ins->data.label.name))
 		return false;
 	char label[512];
-	const char *full = arm64_local_label_name(ctx->fn, ins->data.label.name, label, sizeof(label));
+	const char *full = arm64_local_label_name(ctx, ins->data.label.name, label, sizeof(label));
 	if (!full)
 		return false;
 	fprintf(ctx->out, "%s:\n", full);
@@ -1387,7 +1665,7 @@ static bool arm64_emit_jump(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	if (!arm64_record_stack_snapshot(ctx, ins->line, ins->data.jump.target))
 		return false;
 	char label[512];
-	const char *full = arm64_local_label_name(ctx->fn, ins->data.jump.target, label, sizeof(label));
+	const char *full = arm64_local_label_name(ctx, ins->data.jump.target, label, sizeof(label));
 	if (!full)
 		return false;
 	fprintf(ctx->out, "    b %s\n", full);
@@ -1488,6 +1766,21 @@ static bool arm64_emit_stack_alloc(Arm64FunctionContext *ctx, const CCInstructio
 	value.data.reg.name = dst_reg;
 	value.data.reg.is_w = false;
 	return function_stack_push(ctx, value);
+}
+
+static void arm64_emit_debug_location(Arm64FunctionContext *ctx, const CCInstruction *ins)
+{
+	if (!ctx || !ins || !ctx->out)
+		return;
+	if (ins->debug_file == 0 || ins->debug_line == 0)
+		return;
+	uint32_t column = ins->debug_column ? ins->debug_column : 1;
+	if (ctx->current_loc_file == ins->debug_file && ctx->current_loc_line == ins->debug_line && ctx->current_loc_column == column)
+		return;
+	ctx->current_loc_file = ins->debug_file;
+	ctx->current_loc_line = ins->debug_line;
+	ctx->current_loc_column = column;
+	fprintf(ctx->out, "    .loc %u %u %u\n", ctx->current_loc_file, ctx->current_loc_line, ctx->current_loc_column);
 }
 
 static bool arm64_emit_load_indirect(Arm64FunctionContext *ctx, const CCInstruction *ins)
@@ -1940,8 +2233,8 @@ static bool arm64_emit_branch(Arm64FunctionContext *ctx, const CCInstruction *in
 		return false;
 	char true_label[512];
 	char false_label[512];
-	const char *true_full = arm64_local_label_name(ctx->fn, ins->data.branch.true_target, true_label, sizeof(true_label));
-	const char *false_full = arm64_local_label_name(ctx->fn, ins->data.branch.false_target, false_label, sizeof(false_label));
+	const char *true_full = arm64_local_label_name(ctx, ins->data.branch.true_target, true_label, sizeof(true_label));
+	const char *false_full = arm64_local_label_name(ctx, ins->data.branch.false_target, false_label, sizeof(false_label));
 	if (!true_full || !false_full)
 		return false;
 	FILE *out = ctx->out;
@@ -2403,10 +2696,14 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 
 	if (ins->data.call.symbol && !is_indirect)
 	{
+		const bool target_is_internal = module_has_function(ctx->module->module, ins->data.call.symbol);
+		const char *mapped = arm64_module_symbol_alias(ctx->module, ins->data.call.symbol);
+		const char *symbol_name = mapped ? mapped : ins->data.call.symbol;
 		char symbol_buf[256];
-		const char *sym = symbol_with_underscore(ins->data.call.symbol, symbol_buf, sizeof(symbol_buf));
-		fprintf(ctx->out, "    bl %s\n", sym ? sym : ins->data.call.symbol);
-		symbol_set_add(&ctx->module->externs, sym ? sym : ins->data.call.symbol);
+		const char *sym = symbol_with_underscore(symbol_name, symbol_buf, sizeof(symbol_buf));
+		fprintf(ctx->out, "    bl %s\n", sym ? sym : symbol_name);
+		if (!target_is_internal)
+			symbol_set_add(&ctx->module->externs, sym ? sym : symbol_name);
 	}
 	else
 	{
@@ -2491,6 +2788,7 @@ static bool arm64_emit_ret(Arm64FunctionContext *ctx, const CCInstruction *ins)
 
 static bool arm64_emit_instruction(Arm64FunctionContext *ctx, const CCInstruction *ins)
 {
+	arm64_emit_debug_location(ctx, ins);
 	switch (ins->kind)
 	{
 	case CC_INSTR_CONST:
@@ -2557,11 +2855,13 @@ static bool arm64_emit_literal_function(Arm64FunctionContext *ctx)
 		emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "literal function '%s' has no body", name);
 		return false;
 	}
+	const char *export_name = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
 	char symbol_buf[256];
-	const char *fn_symbol = symbol_with_underscore(ctx->fn->name, symbol_buf, sizeof(symbol_buf));
-	fprintf(ctx->out, ".globl %s\n", fn_symbol ? fn_symbol : ctx->fn->name);
+	const char *fn_symbol = export_name ? symbol_with_underscore(export_name, symbol_buf, sizeof(symbol_buf)) : NULL;
+	const char *visible = fn_symbol ? fn_symbol : (export_name ? export_name : "__cc_literal");
+	fprintf(ctx->out, ".globl %s\n", visible);
 	fprintf(ctx->out, ".p2align 2\n");
-	fprintf(ctx->out, "%s:\n", fn_symbol ? fn_symbol : ctx->fn->name);
+	fprintf(ctx->out, "%s:\n", visible);
 	for (size_t i = 0; i < ctx->fn->literal_count; ++i)
 	{
 		const char *line = ctx->fn->literal_lines[i] ? ctx->fn->literal_lines[i] : "";
@@ -2576,7 +2876,11 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 		return false;
 
 	if (ctx->fn->is_literal)
-		return arm64_emit_literal_function(ctx);
+	{
+		bool ok = arm64_emit_literal_function(ctx);
+		arm64_label_aliases_destroy(ctx);
+		return ok;
+	}
 
 	ctx->param_offsets = NULL;
 	ctx->param_types = NULL;
@@ -2590,6 +2894,9 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	ctx->has_vararg_area = false;
 	ctx->vararg_area_offset = 0;
 	ctx->vararg_gp_start = 0;
+	ctx->current_loc_file = 0;
+	ctx->current_loc_line = 0;
+	ctx->current_loc_column = 0;
 
 	size_t param_count = ctx->fn->param_count;
 	size_t local_count = ctx->fn->local_count;
@@ -2654,11 +2961,13 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 		ctx->temp_area_size = 0;
 	ctx->frame_size = align_up_size(param_local_bytes + ctx->temp_area_size, ARM64_STACK_ALIGNMENT);
 
+	const char *export_name = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
 	char symbol_buf[256];
-	const char *fn_symbol = symbol_with_underscore(ctx->fn->name, symbol_buf, sizeof(symbol_buf));
-	fprintf(ctx->out, ".globl %s\n", fn_symbol ? fn_symbol : ctx->fn->name);
+	const char *fn_symbol = export_name ? symbol_with_underscore(export_name, symbol_buf, sizeof(symbol_buf)) : NULL;
+	const char *visible = fn_symbol ? fn_symbol : (export_name ? export_name : "__cc_fn");
+	fprintf(ctx->out, ".globl %s\n", visible);
 	fprintf(ctx->out, ".p2align 2\n");
-	fprintf(ctx->out, "%s:\n", fn_symbol ? fn_symbol : ctx->fn->name);
+	fprintf(ctx->out, "%s:\n", visible);
 	fprintf(ctx->out, "    stp x29, x30, [sp, #-16]!\n");
 	fprintf(ctx->out, "    mov x29, sp\n");
 	fprintf(ctx->out, "    stp %s, x28, [sp, #-16]!\n", ARM64_FRAME_REG);
@@ -2766,6 +3075,7 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	ctx->temp_area_size = 0;
 	ctx->temp_slot_stride = 0;
 	arm64_clear_stack_snapshots(ctx);
+	arm64_label_aliases_destroy(ctx);
 
 	return true;
 
@@ -2784,6 +3094,7 @@ fail:
 	ctx->temp_area_size = 0;
 	ctx->temp_slot_stride = 0;
 	arm64_clear_stack_snapshots(ctx);
+	arm64_label_aliases_destroy(ctx);
 	return false;
 }
 
@@ -2818,6 +3129,8 @@ static bool arm64_collect_externs(Arm64ModuleContext *ctx)
 			const CCInstruction *ins = &fn->instructions[ii];
 			if (ins->kind == CC_INSTR_CALL && ins->data.call.symbol)
 			{
+				if (module_has_function(ctx->module, ins->data.call.symbol))
+					continue;
 				char symbol_buf[256];
 				const char *sym = symbol_with_underscore(ins->data.call.symbol, symbol_buf, sizeof(symbol_buf));
 				if (!symbol_set_add(&ctx->externs, sym ? sym : ins->data.call.symbol))
@@ -3004,6 +3317,38 @@ static void arm64_emit_globals(const Arm64ModuleContext *ctx)
 	}
 }
 
+static void arm64_emit_debug_files(const Arm64ModuleContext *ctx)
+{
+	if (!ctx || !ctx->module || ctx->module->debug_file_count == 0)
+		return;
+
+	const char *primary = (ctx->module->debug_files && ctx->module->debug_files[0]) ? ctx->module->debug_files[0] : NULL;
+	if (primary && *primary)
+	{
+		char dirbuf[PATH_MAX];
+		char filebuf[PATH_MAX];
+		arm64_split_path(primary, dirbuf, sizeof(dirbuf), filebuf, sizeof(filebuf));
+		const char *dir_part = (dirbuf[0] != '\0') ? dirbuf : ".";
+		const char *file_part = (filebuf[0] != '\0') ? filebuf : primary;
+		fputs(".file 0 ", ctx->out);
+		arm64_write_quoted(ctx->out, dir_part);
+		fputc(' ', ctx->out);
+		arm64_write_quoted(ctx->out, file_part);
+		fputc('\n', ctx->out);
+	}
+
+	for (size_t i = 0; i < ctx->module->debug_file_count; ++i)
+	{
+		const char *path = (ctx->module->debug_files && ctx->module->debug_files[i]) ? ctx->module->debug_files[i] : NULL;
+		if (!path || path[0] == '\0')
+			continue;
+		fprintf(ctx->out, ".file %zu ", i + 1);
+		arm64_write_quoted(ctx->out, path);
+		fputc('\n', ctx->out);
+	}
+	fprintf(ctx->out, "\n");
+}
+
 static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, const CCBackendOptions *options, CCDiagnosticSink *sink, void *userdata)
 {
 	(void)backend;
@@ -3012,19 +3357,9 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	if (!module)
 		return false;
 
-	const char *output_path = NULL;
-	const char *target_os = NULL;
-	if (options && options->options)
-	{
-		for (size_t i = 0; i < options->option_count; ++i)
-		{
-			const CCBackendOption *opt = &options->options[i];
-			if (strcmp(opt->key, "output") == 0)
-				output_path = opt->value;
-			else if (strcmp(opt->key, "target-os") == 0)
-				target_os = opt->value;
-		}
-	}
+	const char *output_path = backend_option_get(options, "output");
+	const char *target_os = backend_option_get(options, "target-os");
+	const char *debug_opt = backend_option_get(options, "debug");
 
 	if (target_os && target_os[0] && !equals_ignore_case(target_os, "macos"))
 	{
@@ -3048,6 +3383,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	ctx.out = out;
 	ctx.module = module;
 	ctx.sink = sink;
+	ctx.keep_debug_names = option_is_enabled(debug_opt);
 	arm64_vararg_cache_load(&ctx);
 
 	fprintf(out, "// ChanceCode macOS ARM64 backend output\n");
@@ -3061,11 +3397,13 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 		string_table_destroy(&ctx.strings);
 		symbol_set_destroy(&ctx.externs);
 		arm64_vararg_cache_destroy(&ctx);
+		hidden_function_aliases_destroy(&ctx);
 		return false;
 	}
 
 	arm64_emit_externs(&ctx);
 	arm64_emit_globals(&ctx);
+	arm64_emit_debug_files(&ctx);
 	fprintf(out, ".section __TEXT,__text,regular,pure_instructions\n\n");
 
 	for (size_t i = 0; i < module->function_count; ++i)
@@ -3076,6 +3414,11 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 		fn_ctx.fn = &module->functions[i];
 		fn_ctx.out = out;
 		fn_ctx.sink = sink;
+		fn_ctx.function_id = ctx.next_function_id++;
+		fn_ctx.symbol_name = arm64_module_function_symbol(&ctx, fn_ctx.fn);
+		if (!fn_ctx.symbol_name)
+			fn_ctx.symbol_name = fn_ctx.fn ? fn_ctx.fn->name : NULL;
+		fn_ctx.obfuscate_labels = !ctx.keep_debug_names;
 		if (!arm64_emit_function(&fn_ctx))
 		{
 			free(fn_ctx.stack);
@@ -3084,6 +3427,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 			string_table_destroy(&ctx.strings);
 			symbol_set_destroy(&ctx.externs);
 			arm64_vararg_cache_destroy(&ctx);
+			hidden_function_aliases_destroy(&ctx);
 			return false;
 		}
 		free(fn_ctx.stack);
@@ -3098,6 +3442,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	string_table_destroy(&ctx.strings);
 	symbol_set_destroy(&ctx.externs);
 	arm64_vararg_cache_destroy(&ctx);
+	hidden_function_aliases_destroy(&ctx);
 	return true;
 }
 

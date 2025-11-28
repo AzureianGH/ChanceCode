@@ -156,6 +156,9 @@ extern "C"
     {
         CCInstrKind kind;
         size_t line;
+        uint32_t debug_file;
+        uint32_t debug_line;
+        uint32_t debug_column;
         union
         {
             struct
@@ -275,6 +278,7 @@ extern "C"
         size_t instruction_count;
         size_t instruction_capacity;
         bool is_literal;
+        bool is_hidden;
         bool force_inline_literal;
         bool is_preserve;
         char **literal_lines;
@@ -293,6 +297,9 @@ extern "C"
         CCFunction *functions;
         size_t function_count;
         size_t function_capacity;
+        char **debug_files;
+        size_t debug_file_count;
+        size_t debug_file_capacity;
     } CCModule;
 
     void cc_module_init(CCModule *module, uint32_t version);
@@ -318,6 +325,9 @@ extern "C"
     void cc_module_optimize(CCModule *module, int opt_level);
 
     bool cc_module_write_binary(const CCModule *module, const char *path, CCDiagnosticSink *sink);
+
+    bool cc_module_set_debug_file(CCModule *module, uint32_t id, const char *path);
+    const char *cc_module_get_debug_file(const CCModule *module, uint32_t id);
 
 #ifdef __cplusplus
 }

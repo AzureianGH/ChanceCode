@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +29,9 @@ typedef struct LoaderState
     size_t pending_addr_global_capacity;
     int reading_literal;
     CCFunction *literal_fn;
+    uint32_t current_debug_file;
+    uint32_t current_debug_line;
+    uint32_t current_debug_column;
 } LoaderState;
 
 static CCGlobal *find_global(CCModule *module, const char *name);
@@ -37,6 +41,9 @@ static void strip_trailing_newline(char *line);
 static bool cc_function_literal_append(CCFunction *fn, const char *text);
 static bool mark_function_preserve(LoaderState *st, const char *name);
 static bool mark_function_force_inline_literal(LoaderState *st, const char *name);
+static CCInstruction *append_instruction(LoaderState *st, CCFunction *fn, CCInstrKind kind);
+static bool parse_file_directive(LoaderState *st, char *line);
+static bool parse_loc_directive(LoaderState *st, char *line);
 
 static void loader_diag(LoaderState *st, CCDiagnosticSeverity severity, size_t line, const char *fmt, ...)
 {
@@ -120,6 +127,19 @@ static bool mark_function_force_inline_literal(LoaderState *st, const char *name
         return false;
     fn->force_inline_literal = true;
     return true;
+}
+
+static CCInstruction *append_instruction(LoaderState *st, CCFunction *fn, CCInstrKind kind)
+{
+    if (!st || !fn)
+        return NULL;
+    CCInstruction *ins = cc_function_append_instruction(fn, kind, st->line);
+    if (!ins)
+        return NULL;
+    ins->debug_file = st->current_debug_file;
+    ins->debug_line = st->current_debug_line;
+    ins->debug_column = st->current_debug_column;
+    return ins;
 }
 
 static bool pending_noreturn_add(LoaderState *st, const char *name)
@@ -1642,6 +1662,117 @@ static bool parse_type_list(LoaderState *st, const char *list, CCValueType **out
     return true;
 }
 
+static bool parse_file_directive(LoaderState *st, char *line)
+{
+    if (!st || !line)
+        return false;
+
+    char *cursor = line;
+    while (*cursor && isspace((unsigned char)*cursor))
+        ++cursor;
+
+    char *id_tok = cursor;
+    while (*cursor && !isspace((unsigned char)*cursor))
+        ++cursor;
+    if (*cursor)
+        *cursor++ = '\0';
+
+    if (*id_tok == '\0')
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, ".file requires an id");
+        return false;
+    }
+
+    uint32_t id = 0;
+    if (!parse_uint32_token(id_tok, &id) || id == 0)
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, "invalid .file id '%s'", id_tok);
+        return false;
+    }
+
+    while (*cursor && isspace((unsigned char)*cursor))
+        ++cursor;
+    if (*cursor != '"')
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, ".file requires a quoted path");
+        return false;
+    }
+
+    char *raw = NULL;
+    size_t raw_len = 0;
+    if (!parse_string_literal(cursor, &raw, &raw_len, NULL))
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, "malformed .file path literal");
+        return false;
+    }
+
+    char *path = (char *)malloc(raw_len + 1);
+    if (!path)
+    {
+        free(raw);
+        return false;
+    }
+    memcpy(path, raw, raw_len);
+    path[raw_len] = '\0';
+    free(raw);
+
+    bool ok = cc_module_set_debug_file(st->module, id, path);
+    free(path);
+    if (!ok)
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, "failed to record .file entry %u", id);
+        return false;
+    }
+
+    return true;
+}
+
+static bool parse_loc_directive(LoaderState *st, char *line)
+{
+    if (!st || !line)
+        return false;
+
+    char *file_tok = strtok(line, " \t");
+    char *line_tok = strtok(NULL, " \t");
+    char *col_tok = strtok(NULL, " \t");
+
+    if (!file_tok || !line_tok || !col_tok)
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, ".loc requires <file-id> <line> <column>");
+        return false;
+    }
+
+    uint32_t file_id = 0;
+    uint32_t line_no = 0;
+    uint32_t col_no = 0;
+    if (!parse_uint32_token(file_tok, &file_id))
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, "invalid .loc file id '%s'", file_tok);
+        return false;
+    }
+    if (!parse_uint32_token(line_tok, &line_no))
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, "invalid .loc line '%s'", line_tok);
+        return false;
+    }
+    if (!parse_uint32_token(col_tok, &col_no))
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, "invalid .loc column '%s'", col_tok);
+        return false;
+    }
+
+    if (file_id != 0 && !cc_module_get_debug_file(st->module, file_id))
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, ".loc references unknown .file id %u", file_id);
+        return false;
+    }
+
+    st->current_debug_file = file_id;
+    st->current_debug_line = line_no;
+    st->current_debug_column = col_no;
+    return true;
+}
+
 static bool parse_global(LoaderState *st, char *line)
 {
     char *cursor = line + 7; /* skip ".global" */
@@ -2013,7 +2144,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "invalid const type '%s'", type_tok);
             return false;
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_CONST, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_CONST);
         if (!ins)
             return false;
         ins->data.constant.type = ty;
@@ -2104,7 +2235,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "malformed string literal");
             return false;
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_CONST_STRING, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_CONST_STRING);
         if (!ins)
         {
             free(data);
@@ -2139,7 +2270,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "parameter index %u out of range", index);
             return false;
         }
-        ins = cc_function_append_instruction(fn, strcmp(mnemonic, "load_param") == 0 ? CC_INSTR_LOAD_PARAM : CC_INSTR_ADDR_PARAM, st->line);
+        ins = append_instruction(st, fn, strcmp(mnemonic, "load_param") == 0 ? CC_INSTR_LOAD_PARAM : CC_INSTR_ADDR_PARAM);
         if (!ins)
             return false;
         ins->data.param.index = index;
@@ -2171,7 +2302,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             kind = CC_INSTR_STORE_LOCAL;
         else if (strcmp(mnemonic, "addr_local") == 0)
             kind = CC_INSTR_ADDR_LOCAL;
-        ins = cc_function_append_instruction(fn, kind, st->line);
+        ins = append_instruction(st, fn, kind);
         if (!ins)
             return false;
         ins->data.local.index = index;
@@ -2220,7 +2351,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             return false;
         }
 
-        ins = cc_function_append_instruction(fn, kind, st->line);
+        ins = append_instruction(st, fn, kind);
         if (!ins)
             return false;
         ins->data.global.symbol = duplicate_token(symbol);
@@ -2243,7 +2374,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             return false;
         }
         CCInstrKind kind = strcmp(mnemonic, "load_indirect") == 0 ? CC_INSTR_LOAD_INDIRECT : CC_INSTR_STORE_INDIRECT;
-        ins = cc_function_append_instruction(fn, kind, st->line);
+        ins = append_instruction(st, fn, kind);
         if (!ins)
             return false;
         ins->data.memory.type = ty;
@@ -2284,7 +2415,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
                 return false;
             }
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_BINOP, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_BINOP);
         if (!ins)
             return false;
         ins->data.binop.op = op;
@@ -2314,7 +2445,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "invalid type '%s'", type_tok);
             return false;
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_UNOP, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_UNOP);
         if (!ins)
             return false;
         ins->data.unop.op = op;
@@ -2355,7 +2486,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
                 return false;
             }
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_COMPARE, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_COMPARE);
         if (!ins)
             return false;
         ins->data.compare.op = cond;
@@ -2387,7 +2518,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "invalid convert types");
             return false;
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_CONVERT, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_CONVERT);
         if (!ins)
             return false;
         ins->data.convert.kind = kind;
@@ -2412,7 +2543,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "invalid stack_alloc operands");
             return false;
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_STACK_ALLOC, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_STACK_ALLOC);
         if (!ins)
             return false;
         ins->data.stack_alloc.size_bytes = size;
@@ -2428,7 +2559,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "label requires a name");
             return false;
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_LABEL, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_LABEL);
         if (!ins)
             return false;
         ins->data.label.name = duplicate_token(name_tok);
@@ -2443,7 +2574,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "jump requires a label");
             return false;
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_JUMP, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_JUMP);
         if (!ins)
             return false;
         ins->data.jump.target = duplicate_token(target);
@@ -2459,7 +2590,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "branch requires <true> <false> labels");
             return false;
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_BRANCH, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_BRANCH);
         if (!ins)
             return false;
         ins->data.branch.true_target = duplicate_token(true_tok);
@@ -2505,7 +2636,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
         size_t arg_count = 0;
         if (!parse_type_list(st, args_tok, &arg_types, &arg_count))
             return false;
-        ins = cc_function_append_instruction(fn, CC_INSTR_CALL_INDIRECT, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_CALL_INDIRECT);
         if (!ins)
         {
             free(arg_types);
@@ -2541,7 +2672,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
         size_t arg_count = 0;
         if (!parse_type_list(st, args_list, &arg_types, &arg_count))
             return false;
-        ins = cc_function_append_instruction(fn, CC_INSTR_CALL, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_CALL);
         if (!ins)
         {
             free(arg_types);
@@ -2569,7 +2700,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
             loader_diag(st, CC_DIAG_ERROR, st->line, "invalid drop type '%s'", type_tok);
             return false;
         }
-        ins = cc_function_append_instruction(fn, CC_INSTR_DROP, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_DROP);
         if (!ins)
             return false;
         ins->data.drop.type = ty;
@@ -2579,7 +2710,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
     if (strcmp(mnemonic, "ret") == 0)
     {
         const char *mode = strtok(NULL, " \t");
-        ins = cc_function_append_instruction(fn, CC_INSTR_RET, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_RET);
         if (!ins)
             return false;
         bool has_value = fn->return_type != CC_TYPE_VOID;
@@ -2609,7 +2740,7 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
         const char *text = strtok(NULL, "");
         if (!text)
             text = "";
-        ins = cc_function_append_instruction(fn, CC_INSTR_COMMENT, st->line);
+        ins = append_instruction(st, fn, CC_INSTR_COMMENT);
         if (!ins)
             return false;
         ins->data.comment.text = duplicate_token(text);
@@ -2745,6 +2876,16 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
         if (strncmp(line, ".global", 7) == 0)
         {
             if (!parse_global(&st, line))
+            {
+                success = false;
+                break;
+            }
+            continue;
+        }
+
+        if (strncmp(line, ".file", 5) == 0)
+        {
+            if (!parse_file_directive(&st, line + 5))
             {
                 success = false;
                 break;
@@ -2911,6 +3052,10 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
                 break;
             }
 
+            st.current_debug_file = 0;
+            st.current_debug_line = 0;
+            st.current_debug_column = 0;
+
             current_fn->return_type = CC_TYPE_VOID;
             current_fn->param_count = 0;
             current_fn->local_count = 0;
@@ -2975,6 +3120,10 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
                 {
                     current_fn->is_preserve = true;
                 }
+                else if (strcmp(token, "hidden") == 0)
+                {
+                    current_fn->is_hidden = true;
+                }
                 else if (strcmp(token, "force-inline-literal") == 0)
                 {
                     current_fn->force_inline_literal = true;
@@ -3020,6 +3169,9 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             }
 
             current_fn = NULL;
+            st.current_debug_file = 0;
+            st.current_debug_line = 0;
+            st.current_debug_column = 0;
             continue;
         }
 
@@ -3028,6 +3180,16 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             loader_diag(&st, CC_DIAG_ERROR, st.line, "statement outside of function");
             success = false;
             break;
+        }
+
+        if (strncmp(line, ".loc", 4) == 0 && (line[4] == ' ' || line[4] == '\t'))
+        {
+            if (!parse_loc_directive(&st, line + 4))
+            {
+                success = false;
+                break;
+            }
+            continue;
         }
 
         if (strncmp(line, ".params", 7) == 0)
