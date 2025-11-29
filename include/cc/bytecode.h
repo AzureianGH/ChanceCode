@@ -328,6 +328,7 @@ extern "C"
 
     bool cc_module_set_debug_file(CCModule *module, uint32_t id, const char *path);
     const char *cc_module_get_debug_file(const CCModule *module, uint32_t id);
+    void cc_module_strip_metadata(CCModule *module);
 
 #ifdef __cplusplus
 }

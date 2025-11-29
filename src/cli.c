@@ -2,6 +2,8 @@
 #include "cc/diagnostics.h"
 #include "cc/loader.h"
 
+#include <ctype.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +13,7 @@ void cc_register_builtin_backends(void);
 
 static void print_usage(void)
 {
-    fprintf(stderr, "Usage: ccb <input.ccb> [-O0|-O1|-O2|-O3] [--backend NAME] [--output PATH] [--option key=value] [--list-backends] [--emit-ccbin PATH]\n");
+    fprintf(stderr, "Usage: ccb <input.ccb> [-O0|-O1|-O2|-O3] [--backend NAME] [--output PATH] [--option key=value] [--list-backends] [--emit-ccbin PATH] [--strip] [--strip-hard] [--obfuscate]\n");
 }
 
 static bool parse_option_assignment(const char *arg, CCBackendOption *out_option)
@@ -51,13 +53,228 @@ static void free_options(CCBackendOption *options, size_t count)
     }
 }
 
+typedef struct
+{
+    char *from;
+    char *to;
+} StripMapEntry;
+
+typedef struct
+{
+    StripMapEntry *entries;
+    size_t count;
+    size_t capacity;
+} StripMap;
+
+static char *cli_strdup(const char *src)
+{
+    if (!src)
+        return NULL;
+    size_t len = strlen(src);
+    char *copy = (char *)malloc(len + 1);
+    if (!copy)
+        return NULL;
+    memcpy(copy, src, len + 1);
+    return copy;
+}
+
+static void strip_map_free(StripMap *map)
+{
+    if (!map)
+        return;
+    if (map->entries)
+    {
+        for (size_t i = 0; i < map->count; ++i)
+        {
+            free(map->entries[i].from);
+            free(map->entries[i].to);
+        }
+        free(map->entries);
+    }
+    map->entries = NULL;
+    map->count = 0;
+    map->capacity = 0;
+}
+
+static bool strip_map_add_entry(StripMap *map, const char *from, const char *to)
+{
+    if (!map || !from || !*from || !to || !*to)
+        return true;
+    if (map->count == map->capacity)
+    {
+        size_t new_capacity = map->capacity ? map->capacity * 2 : 32;
+        StripMapEntry *grown =
+            (StripMapEntry *)realloc(map->entries, new_capacity * sizeof(StripMapEntry));
+        if (!grown)
+            return false;
+        map->entries = grown;
+        map->capacity = new_capacity;
+    }
+    StripMapEntry entry;
+    entry.from = cli_strdup(from);
+    entry.to = cli_strdup(to);
+    if (!entry.from || !entry.to)
+    {
+        free(entry.from);
+        free(entry.to);
+        return false;
+    }
+    map->entries[map->count++] = entry;
+    return true;
+}
+
+static int strip_map_entry_cmp(const void *a, const void *b)
+{
+    const StripMapEntry *ea = (const StripMapEntry *)a;
+    const StripMapEntry *eb = (const StripMapEntry *)b;
+    if (!ea || !eb || !ea->from || !eb->from)
+        return 0;
+    return strcmp(ea->from, eb->from);
+}
+
+static void strip_map_sort(StripMap *map)
+{
+    if (!map || map->count <= 1 || !map->entries)
+        return;
+    qsort(map->entries, map->count, sizeof(StripMapEntry), strip_map_entry_cmp);
+}
+
+static const char *strip_map_lookup(const StripMap *map, const char *name)
+{
+    if (!map || !map->entries || map->count == 0 || !name || !*name)
+        return NULL;
+    size_t lo = 0;
+    size_t hi = map->count;
+    while (lo < hi)
+    {
+        size_t mid = lo + (hi - lo) / 2;
+        int cmp = strcmp(name, map->entries[mid].from);
+        if (cmp == 0)
+            return map->entries[mid].to;
+        if (cmp < 0)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return NULL;
+}
+
+static bool strip_map_load(const char *path, StripMap *map)
+{
+    if (!path || !map)
+        return false;
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+    {
+        fprintf(stderr, "error: failed to open strip map '%s' (%s)\n", path,
+                strerror(errno));
+        return false;
+    }
+    char line[2048];
+    while (fgets(line, sizeof(line), fp))
+    {
+        char *cursor = line;
+        while (*cursor && isspace((unsigned char)*cursor))
+            ++cursor;
+        if (*cursor == '\0' || *cursor == '#' || *cursor == ';')
+            continue;
+        char *from = cursor;
+        while (*cursor && !isspace((unsigned char)*cursor))
+            ++cursor;
+        if (*cursor)
+            *cursor++ = '\0';
+        while (*cursor && isspace((unsigned char)*cursor))
+            ++cursor;
+        if (*cursor == '\0')
+            continue;
+        char *to = cursor;
+        while (*cursor && !isspace((unsigned char)*cursor))
+            ++cursor;
+        *cursor = '\0';
+        if (!strip_map_add_entry(map, from, to))
+        {
+            fprintf(stderr, "error: out of memory while reading strip map '%s'\n",
+                    path);
+            fclose(fp);
+            return false;
+        }
+    }
+    fclose(fp);
+    strip_map_sort(map);
+    return true;
+}
+
+static bool rename_symbol_if_needed(char **slot, const StripMap *map)
+{
+    if (!slot || !*slot)
+        return true;
+    const char *replacement = strip_map_lookup(map, *slot);
+    if (!replacement)
+        return true;
+    char *copy = cli_strdup(replacement);
+    if (!copy)
+        return false;
+    free(*slot);
+    *slot = copy;
+    return true;
+}
+
+static bool patch_instruction_symbols(CCInstruction *ins, const StripMap *map)
+{
+    if (!ins)
+        return true;
+    switch (ins->kind)
+    {
+    case CC_INSTR_CALL:
+        return rename_symbol_if_needed(&ins->data.call.symbol, map);
+    case CC_INSTR_LOAD_GLOBAL:
+    case CC_INSTR_STORE_GLOBAL:
+    case CC_INSTR_ADDR_GLOBAL:
+        return rename_symbol_if_needed(&ins->data.global.symbol, map);
+    default:
+        return true;
+    }
+}
+
+static bool apply_strip_map(CCModule *module, const StripMap *map)
+{
+    if (!module || !map || map->count == 0)
+        return true;
+    for (size_t i = 0; i < module->global_count; ++i)
+    {
+        if (!rename_symbol_if_needed(&module->globals[i].name, map))
+            return false;
+    }
+    for (size_t i = 0; i < module->extern_count; ++i)
+    {
+        if (!rename_symbol_if_needed(&module->externs[i].name, map))
+            return false;
+    }
+    for (size_t i = 0; i < module->function_count; ++i)
+    {
+        CCFunction *fn = &module->functions[i];
+        if (!rename_symbol_if_needed(&fn->name, map))
+            return false;
+        for (size_t j = 0; j < fn->instruction_count; ++j)
+        {
+            if (!patch_instruction_symbols(&fn->instructions[j], map))
+                return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char **argv)
 {
     const char *input_path = NULL;
     const char *backend_name = NULL;
     const char *output_path = NULL;
     const char *ccbin_path = NULL;
+    const char *strip_map_path = NULL;
     bool list_backends = false;
+    bool strip_metadata = false;
+    bool strip_hard = false;
+    bool obfuscate = false;
     int opt_level = 0;
 
     CCBackendOption option_storage[16];
@@ -96,6 +313,21 @@ int main(int argc, char **argv)
                 return 1;
             }
             ccbin_path = argv[++i];
+        }
+        else if (strcmp(arg, "--strip") == 0)
+        {
+            strip_metadata = true;
+        }
+        else if (strcmp(arg, "--strip-hard") == 0)
+        {
+            strip_metadata = true;
+            strip_hard = true;
+        }
+        else if (strcmp(arg, "--obfuscate") == 0)
+        {
+            strip_metadata = true;
+            strip_hard = true;
+            obfuscate = true;
         }
         else if (strcmp(arg, "--option") == 0)
         {
@@ -158,6 +390,15 @@ int main(int argc, char **argv)
         }
     }
 
+    for (size_t i = 0; i < option_count; ++i)
+    {
+        if (option_storage[i].key && strcmp(option_storage[i].key, "strip-map") == 0)
+        {
+            strip_map_path = option_storage[i].value;
+            break;
+        }
+    }
+
     cc_register_builtin_backends();
 
     if (list_backends)
@@ -189,7 +430,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    bool only_ccbin = (ccbin_path != NULL) && (backend_name == NULL) && (output_path == NULL) && (option_count == 0);
+    bool only_ccbin = (ccbin_path != NULL) && (backend_name == NULL) && (output_path == NULL);
 
     const CCBackend *backend = NULL;
     if (backend_name)
@@ -217,6 +458,39 @@ int main(int argc, char **argv)
 
     cc_module_optimize(&module, opt_level);
 
+    if (strip_metadata)
+        cc_module_strip_metadata(&module);
+
+    if (strip_hard)
+    {
+        if (!strip_map_path || *strip_map_path == '\0')
+        {
+            fprintf(stderr,
+                    "error: --strip-hard requires --option strip-map=<path>\n");
+            cc_module_free(&module);
+            free_options(option_storage, option_count);
+            return 1;
+        }
+        StripMap map = {0};
+        if (!strip_map_load(strip_map_path, &map))
+        {
+            cc_module_free(&module);
+            free_options(option_storage, option_count);
+            return 1;
+        }
+        bool map_ok = apply_strip_map(&module, &map);
+        strip_map_free(&map);
+        if (!map_ok)
+        {
+            fprintf(stderr,
+                    "error: failed to apply strip map '%s' to module symbols\n",
+                    strip_map_path);
+            cc_module_free(&module);
+            free_options(option_storage, option_count);
+            return 1;
+        }
+    }
+
     if (ccbin_path)
     {
         if (!cc_module_write_binary(&module, ccbin_path, &sink))
@@ -230,7 +504,7 @@ int main(int argc, char **argv)
     bool emit_ok = true;
     if (backend)
     {
-        CCBackendOption stack_options[18];
+        CCBackendOption stack_options[20];
         size_t stack_option_count = option_count;
         if (option_count > 0)
         {
@@ -252,6 +526,27 @@ int main(int argc, char **argv)
             opt_option.value = opt_level_buf;
             stack_options[stack_option_count++] = opt_option;
         }
+            if (strip_metadata && stack_option_count < sizeof(stack_options) / sizeof(stack_options[0]))
+            {
+                CCBackendOption strip_option;
+                strip_option.key = "strip";
+                strip_option.value = "1";
+                stack_options[stack_option_count++] = strip_option;
+            }
+            if (strip_hard && stack_option_count < sizeof(stack_options) / sizeof(stack_options[0]))
+            {
+                CCBackendOption strip_hard_option;
+                strip_hard_option.key = "strip-hard";
+                strip_hard_option.value = "1";
+                stack_options[stack_option_count++] = strip_hard_option;
+            }
+            if (obfuscate && stack_option_count < sizeof(stack_options) / sizeof(stack_options[0]))
+            {
+                CCBackendOption obfuscate_option;
+                obfuscate_option.key = "obfuscate";
+                obfuscate_option.value = "1";
+                stack_options[stack_option_count++] = obfuscate_option;
+            }
 
         CCBackendOptions options;
         options.options = stack_options;

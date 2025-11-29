@@ -31,6 +31,7 @@ static const char *const ARM64_SCRATCH_GP_REGS32[] = {"w9", "w10", "w11", "w12"}
 typedef struct
 {
 	char *label;
+	char *lookup_name;
 	const char *bytes;
 	size_t length;
 } Arm64StringLiteral;
@@ -66,6 +67,18 @@ typedef struct
 	char *symbol;
 	size_t fixed_param_count;
 } Arm64VarargEntry;
+
+typedef struct
+{
+	char *symbol;
+	char *lookup_name;
+	uint8_t *encoded_bytes;
+	size_t length;
+	uint32_t key;
+	char desc_label[32];
+	char str_label[32];
+	char stub_label[32];
+} Arm64ObfEntry;
 
 typedef enum
 {
@@ -111,11 +124,18 @@ typedef struct
 	bool vararg_cache_loaded;
 	size_t string_counter;
 	bool keep_debug_names;
+	bool prefer_local_hidden_symbols;
+	bool obfuscate_calls;
+	uint32_t obfuscate_seed;
 	size_t next_function_id;
 	size_t hidden_symbol_counter;
 	Arm64FunctionAlias *hidden_fn_aliases;
 	size_t hidden_fn_alias_count;
 	size_t hidden_fn_alias_capacity;
+	Arm64ObfEntry *obf_entries;
+	size_t obf_entry_count;
+	size_t obf_entry_capacity;
+	size_t obf_entry_id_counter;
 } Arm64ModuleContext;
 
 typedef struct
@@ -156,15 +176,24 @@ typedef struct
 	size_t function_id;
 	const char *symbol_name;
 	bool obfuscate_labels;
+	bool prefix_labels;
 	Arm64LabelAlias *label_aliases;
 	size_t label_alias_count;
 	size_t label_alias_capacity;
 	size_t next_label_id;
+	size_t obfuscate_call_counter;
 } Arm64FunctionContext;
 
 static void arm64_vararg_cache_load(Arm64ModuleContext *ctx);
 static void arm64_vararg_cache_destroy(Arm64ModuleContext *ctx);
 static const Arm64VarargEntry *arm64_vararg_cache_lookup(const Arm64ModuleContext *ctx, const char *symbol);
+static bool symbol_set_add(Arm64SymbolSet *set, const char *symbol);
+static Arm64ObfEntry *arm64_obf_get_entry(Arm64ModuleContext *ctx, const char *symbol);
+static bool arm64_emit_obf_support(Arm64ModuleContext *ctx);
+static void arm64_obf_entries_destroy(Arm64ModuleContext *ctx);
+static uint32_t arm64_obfuscate_mix(uint32_t v);
+static uint32_t arm64_obfuscate_next(Arm64FunctionContext *ctx);
+static const char *arm64_obfuscate_select_register(Arm64FunctionContext *ctx);
 
 typedef struct
 {
@@ -486,7 +515,8 @@ static const char *arm64_module_function_symbol(Arm64ModuleContext *ctx, const C
 		return fn->name;
 	size_t id = ++ctx->hidden_symbol_counter;
 	char buffer[64];
-	snprintf(buffer, sizeof(buffer), "__cc_hidden_fn%zu", id);
+	const char *prefix = ctx->prefer_local_hidden_symbols ? "Lcc_hidden_fn" : "__cc_hidden_fn";
+	snprintf(buffer, sizeof(buffer), "%s%zu", prefix, id);
 	char *alias = arm64_strdup(buffer);
 	if (!alias)
 		return fn->name;
@@ -560,7 +590,7 @@ static const char *arm64_alias_label(Arm64FunctionContext *ctx, const char *orig
 	if (!arm64_ensure_label_alias_capacity(ctx, ctx->label_alias_count + 1))
 		return original;
 	char buffer[64];
-	snprintf(buffer, sizeof(buffer), "__cc_label_f%zu_%zu", ctx->function_id, ctx->next_label_id++);
+	snprintf(buffer, sizeof(buffer), "Lcc_label_f%zu_%zu", ctx->function_id, ctx->next_label_id++);
 	char *alias = arm64_strdup(buffer);
 	char *original_copy = arm64_strdup(original);
 	if (!alias || !original_copy)
@@ -609,6 +639,213 @@ static bool option_is_enabled(const char *value)
 		return false;
 	if (equals_ignore_case(value, "false") || equals_ignore_case(value, "off"))
 		return false;
+	return true;
+}
+
+static bool arm64_obf_ensure_capacity(Arm64ModuleContext *ctx, size_t desired)
+{
+	if (!ctx)
+		return false;
+	if (ctx->obf_entry_capacity >= desired)
+		return true;
+	size_t new_capacity = ctx->obf_entry_capacity ? ctx->obf_entry_capacity * 2 : 4;
+	while (new_capacity < desired)
+		new_capacity *= 2;
+	Arm64ObfEntry *grown = (Arm64ObfEntry *)realloc(ctx->obf_entries, new_capacity * sizeof(Arm64ObfEntry));
+	if (!grown)
+		return false;
+	ctx->obf_entries = grown;
+	ctx->obf_entry_capacity = new_capacity;
+	return true;
+}
+
+static void arm64_obf_entry_destroy(Arm64ObfEntry *entry)
+{
+	if (!entry)
+		return;
+	free(entry->symbol);
+	free(entry->lookup_name);
+	free(entry->encoded_bytes);
+	entry->symbol = NULL;
+	entry->lookup_name = NULL;
+	entry->encoded_bytes = NULL;
+}
+
+static void arm64_obf_entries_destroy(Arm64ModuleContext *ctx)
+{
+	if (!ctx || !ctx->obf_entries)
+		return;
+	for (size_t i = 0; i < ctx->obf_entry_count; ++i)
+		arm64_obf_entry_destroy(&ctx->obf_entries[i]);
+	free(ctx->obf_entries);
+	ctx->obf_entries = NULL;
+	ctx->obf_entry_count = 0;
+	ctx->obf_entry_capacity = 0;
+	ctx->obf_entry_id_counter = 0;
+}
+
+static Arm64ObfEntry *arm64_obf_get_entry(Arm64ModuleContext *ctx, const char *symbol)
+{
+	if (!ctx || !symbol)
+		return NULL;
+	for (size_t i = 0; i < ctx->obf_entry_count; ++i)
+	{
+		if (ctx->obf_entries[i].symbol && strcmp(ctx->obf_entries[i].symbol, symbol) == 0)
+			return &ctx->obf_entries[i];
+	}
+	if (!arm64_obf_ensure_capacity(ctx, ctx->obf_entry_count + 1))
+		return NULL;
+	Arm64ObfEntry *entry = &ctx->obf_entries[ctx->obf_entry_count++];
+	memset(entry, 0, sizeof(*entry));
+	const char *lookup = (symbol[0] == '_') ? symbol + 1 : symbol;
+	entry->symbol = arm64_strdup(symbol);
+	entry->lookup_name = arm64_strdup(lookup);
+	if (!entry->symbol || !entry->lookup_name)
+	{
+		arm64_obf_entry_destroy(entry);
+		ctx->obf_entry_count--;
+		return NULL;
+	}
+	entry->length = strlen(entry->lookup_name);
+	entry->encoded_bytes = (uint8_t *)malloc(entry->length ? entry->length : 1);
+	if (!entry->encoded_bytes)
+	{
+		arm64_obf_entry_destroy(entry);
+		ctx->obf_entry_count--;
+		return NULL;
+	}
+	uint32_t raw = arm64_obfuscate_mix((uint32_t)ctx->obf_entry_id_counter * 0x9e3779b1u ^ ctx->obfuscate_seed);
+	uint32_t key = raw & 0xFFu;
+	if (key == 0)
+		key = 0x5Au;
+	entry->key = key;
+	for (size_t i = 0; i < entry->length; ++i)
+		entry->encoded_bytes[i] = ((uint8_t)entry->lookup_name[i]) ^ (uint8_t)key;
+	size_t id = ctx->obf_entry_id_counter++;
+	snprintf(entry->desc_label, sizeof(entry->desc_label), "Lcc_obf_desc%zu", id);
+	snprintf(entry->str_label, sizeof(entry->str_label), "Lcc_obf_str%zu", id);
+	snprintf(entry->stub_label, sizeof(entry->stub_label), "Lcc_obf_stub%zu", id);
+	return entry;
+}
+
+static uint32_t arm64_obfuscate_mix(uint32_t v)
+{
+	v ^= v >> 17;
+	v *= 0xed5ad4bbu;
+	v ^= v >> 11;
+	v *= 0xac4c1b51u;
+	v ^= v >> 15;
+	v *= 0x31848babu;
+	v ^= v >> 14;
+	return v ? v : 0x7f4a7c15u;
+}
+
+static uint32_t arm64_obfuscate_next(Arm64FunctionContext *ctx)
+{
+	uint32_t base = ctx->module->obfuscate_seed;
+	base ^= (uint32_t)(ctx->function_id * 0x9e3779b1u);
+	base ^= (uint32_t)(ctx->obfuscate_call_counter++ * 0x85ebca6bu);
+	return arm64_obfuscate_mix(base);
+}
+
+static const char *arm64_obfuscate_select_register(Arm64FunctionContext *ctx)
+{
+	static const char *const regs[] = {"x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17"};
+	uint32_t rnd = arm64_obfuscate_next(ctx);
+	return regs[rnd % (sizeof(regs) / sizeof(regs[0]))];
+}
+
+static bool arm64_emit_obf_support(Arm64ModuleContext *ctx)
+{
+	if (!ctx || ctx->obf_entry_count == 0)
+		return true;
+	FILE *out = ctx->out;
+	if (!out)
+		return false;
+	fprintf(out, ".section __DATA,__data\n");
+	fprintf(out, ".p2align 3\n");
+	for (size_t i = 0; i < ctx->obf_entry_count; ++i)
+	{
+		Arm64ObfEntry *entry = &ctx->obf_entries[i];
+		fprintf(out, "%s:\n", entry->desc_label);
+		fprintf(out, "    .quad 0\n");
+		fprintf(out, "    .long 0x%08x\n", entry->key);
+		fprintf(out, "    .long %zu\n", entry->length);
+		fprintf(out, "    .quad %s\n", entry->str_label);
+	}
+	fprintf(out, ".section __TEXT,__const\n");
+	for (size_t i = 0; i < ctx->obf_entry_count; ++i)
+	{
+		Arm64ObfEntry *entry = &ctx->obf_entries[i];
+		fprintf(out, "%s:\n", entry->str_label);
+		for (size_t b = 0; b < entry->length; ++b)
+		{
+			fprintf(out, "    .byte 0x%02x\n", entry->encoded_bytes[b]);
+		}
+	}
+	fprintf(out, ".section __TEXT,__text,regular,pure_instructions\n");
+	for (size_t i = 0; i < ctx->obf_entry_count; ++i)
+	{
+		Arm64ObfEntry *entry = &ctx->obf_entries[i];
+		fprintf(out, ".p2align 2\n");
+		fprintf(out, "%s:\n", entry->stub_label);
+		fprintf(out, "    adrp x16, %s@PAGE\n", entry->desc_label);
+		fprintf(out, "    add x16, x16, %s@PAGEOFF\n", entry->desc_label);
+		fprintf(out, "    b __cc_obf_call_gate\n\n");
+	}
+	fprintf(out, ".p2align 2\n");
+	fprintf(out, "__cc_obf_call_gate:\n");
+	fprintf(out, "    stp x29, x30, [sp, #-16]!\n");
+	fprintf(out, "    mov x29, sp\n");
+	fprintf(out, "    stp x19, x20, [sp, #-16]!\n");
+	fprintf(out, "    sub sp, sp, #64\n");
+	fprintf(out, "    stp x0, x1, [sp, #0]\n");
+	fprintf(out, "    stp x2, x3, [sp, #16]\n");
+	fprintf(out, "    stp x4, x5, [sp, #32]\n");
+	fprintf(out, "    stp x6, x7, [sp, #48]\n");
+	fprintf(out, "    mov x19, x16\n");
+	fprintf(out, "    ldr x9, [x19]\n");
+	fprintf(out, "    cbnz x9, Lcc_obf_gate_done\n");
+	fprintf(out, "    ldr w10, [x19, #8]\n\n");
+	fprintf(out, "    ldr w11, [x19, #12]\n");
+	fprintf(out, "    ldr x12, [x19, #16]\n");
+	fprintf(out, "    uxtw x13, w11\n");
+	fprintf(out, "    add x13, x13, #1\n");
+	fprintf(out, "    add x13, x13, #15\n");
+	fprintf(out, "    bic x13, x13, #15\n");
+	fprintf(out, "    mov x20, x13\n");
+	fprintf(out, "    sub sp, sp, x20\n");
+	fprintf(out, "    mov x14, sp\n");
+	fprintf(out, "    mov x15, x14\n");
+	fprintf(out, "Lcc_obf_gate_decode:\n");
+	fprintf(out, "    cbz w11, Lcc_obf_gate_decoded\n");
+	fprintf(out, "    ldrb w17, [x12], #1\n");
+	fprintf(out, "    eor w17, w17, w10\n");
+	fprintf(out, "    strb w17, [x15], #1\n");
+	fprintf(out, "    subs w11, w11, #1\n");
+	fprintf(out, "    b.ne Lcc_obf_gate_decode\n");
+	fprintf(out, "Lcc_obf_gate_decoded:\n");
+	fprintf(out, "    mov w17, wzr\n");
+	fprintf(out, "    strb w17, [x15]\n");
+	fprintf(out, "    mov x0, #-2\n");
+	fprintf(out, "    mov x1, x14\n");
+	fprintf(out, "    bl _dlsym\n");
+	fprintf(out, "    mov x9, x0\n");
+	fprintf(out, "    add sp, sp, x20\n");
+	fprintf(out, "    cbnz x9, Lcc_obf_gate_cache\n");
+	fprintf(out, "    bl _abort\n");
+	fprintf(out, "Lcc_obf_gate_cache:\n");
+	fprintf(out, "    str x9, [x19]\n");
+	fprintf(out, "Lcc_obf_gate_done:\n");
+	fprintf(out, "    ldr x9, [x19]\n");
+	fprintf(out, "    ldp x0, x1, [sp, #0]\n");
+	fprintf(out, "    ldp x2, x3, [sp, #16]\n");
+	fprintf(out, "    ldp x4, x5, [sp, #32]\n");
+	fprintf(out, "    ldp x6, x7, [sp, #48]\n");
+	fprintf(out, "    add sp, sp, #64\n");
+	fprintf(out, "    ldp x19, x20, [sp], #16\n");
+	fprintf(out, "    ldp x29, x30, [sp], #16\n");
+	fprintf(out, "    br x9\n\n");
 	return true;
 }
 
@@ -819,10 +1056,26 @@ static bool function_stack_pop(Arm64FunctionContext *ctx, Arm64Value *value)
 	return true;
 }
 
+static bool is_macho_local_symbol(const char *name)
+{
+	if (!name || name[0] != 'L')
+		return false;
+	if (name[1] == '_')
+		return true;
+	if (name[1] == 'c' && name[2] == 'c' && name[3] == '_')
+		return true;
+	return false;
+}
+
 static const char *symbol_with_underscore(const char *name, char *buffer, size_t buffer_size)
 {
-	if (!name || buffer_size < 2)
+	if (!name || buffer_size == 0)
 		return NULL;
+	if (is_macho_local_symbol(name))
+	{
+		snprintf(buffer, buffer_size, "%s", name);
+		return buffer;
+	}
 	snprintf(buffer, buffer_size, "_%s", name);
 	return buffer;
 }
@@ -847,7 +1100,11 @@ static const char *arm64_local_label_name(Arm64FunctionContext *ctx, const char 
 	const char *symbol = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
 	if (!symbol || !buffer || buffer_size == 0)
 		return NULL;
-	snprintf(buffer, buffer_size, "%s__%s", symbol, suffix);
+	bool needs_prefix = ctx->prefix_labels && !is_macho_local_symbol(symbol);
+	if (needs_prefix)
+		snprintf(buffer, buffer_size, "L%s__%s", symbol, suffix);
+	else
+		snprintf(buffer, buffer_size, "%s__%s", symbol, suffix);
 	return buffer;
 }
 
@@ -2701,9 +2958,27 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		const char *symbol_name = mapped ? mapped : ins->data.call.symbol;
 		char symbol_buf[256];
 		const char *sym = symbol_with_underscore(symbol_name, symbol_buf, sizeof(symbol_buf));
-		fprintf(ctx->out, "    bl %s\n", sym ? sym : symbol_name);
-		if (!target_is_internal)
-			symbol_set_add(&ctx->module->externs, sym ? sym : symbol_name);
+		const char *visible = sym ? sym : symbol_name;
+		if (ctx->module->obfuscate_calls && !target_is_internal)
+		{
+			Arm64ObfEntry *entry = arm64_obf_get_entry(ctx->module, visible);
+			if (!entry)
+				goto cleanup;
+			fprintf(ctx->out, "    bl %s\n", entry->stub_label);
+		}
+		else if (ctx->module->obfuscate_calls && target_is_internal)
+		{
+			const char *target_reg = arm64_obfuscate_select_register(ctx);
+			fprintf(ctx->out, "    adrp %s, %s@PAGE\n", target_reg, visible);
+			fprintf(ctx->out, "    add %s, %s, %s@PAGEOFF\n", target_reg, target_reg, visible);
+			fprintf(ctx->out, "    blr %s\n", target_reg);
+		}
+		else
+		{
+			fprintf(ctx->out, "    bl %s\n", visible);
+		}
+		if (!target_is_internal && !ctx->module->obfuscate_calls)
+			symbol_set_add(&ctx->module->externs, visible);
 	}
 	else
 	{
@@ -2859,7 +3134,8 @@ static bool arm64_emit_literal_function(Arm64FunctionContext *ctx)
 	char symbol_buf[256];
 	const char *fn_symbol = export_name ? symbol_with_underscore(export_name, symbol_buf, sizeof(symbol_buf)) : NULL;
 	const char *visible = fn_symbol ? fn_symbol : (export_name ? export_name : "__cc_literal");
-	fprintf(ctx->out, ".globl %s\n", visible);
+	if (!ctx->fn->is_hidden)
+		fprintf(ctx->out, ".globl %s\n", visible);
 	fprintf(ctx->out, ".p2align 2\n");
 	fprintf(ctx->out, "%s:\n", visible);
 	for (size_t i = 0; i < ctx->fn->literal_count; ++i)
@@ -2965,7 +3241,8 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	char symbol_buf[256];
 	const char *fn_symbol = export_name ? symbol_with_underscore(export_name, symbol_buf, sizeof(symbol_buf)) : NULL;
 	const char *visible = fn_symbol ? fn_symbol : (export_name ? export_name : "__cc_fn");
-	fprintf(ctx->out, ".globl %s\n", visible);
+	if (!ctx->fn->is_hidden)
+		fprintf(ctx->out, ".globl %s\n", visible);
 	fprintf(ctx->out, ".p2align 2\n");
 	fprintf(ctx->out, "%s:\n", visible);
 	fprintf(ctx->out, "    stp x29, x30, [sp, #-16]!\n");
@@ -3129,6 +3406,8 @@ static bool arm64_collect_externs(Arm64ModuleContext *ctx)
 			const CCInstruction *ins = &fn->instructions[ii];
 			if (ins->kind == CC_INSTR_CALL && ins->data.call.symbol)
 			{
+				if (ctx->obfuscate_calls)
+					continue;
 				if (module_has_function(ctx->module, ins->data.call.symbol))
 					continue;
 				char symbol_buf[256];
@@ -3360,6 +3639,8 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	const char *output_path = backend_option_get(options, "output");
 	const char *target_os = backend_option_get(options, "target-os");
 	const char *debug_opt = backend_option_get(options, "debug");
+	const char *strip_opt = backend_option_get(options, "strip");
+	const char *obfuscate_opt = backend_option_get(options, "obfuscate");
 
 	if (target_os && target_os[0] && !equals_ignore_case(target_os, "macos"))
 	{
@@ -3384,6 +3665,19 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	ctx.module = module;
 	ctx.sink = sink;
 	ctx.keep_debug_names = option_is_enabled(debug_opt);
+	ctx.prefer_local_hidden_symbols = option_is_enabled(strip_opt);
+	ctx.obfuscate_calls = option_is_enabled(obfuscate_opt);
+	ctx.obfuscate_seed = 0x6b27c9d5u;
+	ctx.obfuscate_seed ^= (uint32_t)(module ? module->function_count : 0) * 0x45d9f3bdu;
+	ctx.obfuscate_seed ^= (uint32_t)(module ? module->global_count : 0) * 0x94d049bbu;
+	ctx.obfuscate_seed ^= (uint32_t)(module ? module->extern_count : 0) * 0x632be59bu;
+	if (!ctx.obfuscate_calls)
+		ctx.obfuscate_seed ^= 0xa0761d65u;
+	else
+	{
+		symbol_set_add(&ctx.externs, "_dlsym");
+		symbol_set_add(&ctx.externs, "_abort");
+	}
 	arm64_vararg_cache_load(&ctx);
 
 	fprintf(out, "// ChanceCode macOS ARM64 backend output\n");
@@ -3398,6 +3692,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 		symbol_set_destroy(&ctx.externs);
 		arm64_vararg_cache_destroy(&ctx);
 		hidden_function_aliases_destroy(&ctx);
+		arm64_obf_entries_destroy(&ctx);
 		return false;
 	}
 
@@ -3419,6 +3714,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 		if (!fn_ctx.symbol_name)
 			fn_ctx.symbol_name = fn_ctx.fn ? fn_ctx.fn->name : NULL;
 		fn_ctx.obfuscate_labels = !ctx.keep_debug_names;
+		fn_ctx.prefix_labels = ctx.keep_debug_names;
 		if (!arm64_emit_function(&fn_ctx))
 		{
 			free(fn_ctx.stack);
@@ -3428,6 +3724,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 			symbol_set_destroy(&ctx.externs);
 			arm64_vararg_cache_destroy(&ctx);
 			hidden_function_aliases_destroy(&ctx);
+			arm64_obf_entries_destroy(&ctx);
 			return false;
 		}
 		free(fn_ctx.stack);
@@ -3435,6 +3732,18 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	}
 
 	arm64_emit_string_literals(&ctx);
+	if (!arm64_emit_obf_support(&ctx))
+	{
+		emit_diag(sink, CC_DIAG_ERROR, 0, "failed to emit obfuscation support");
+		if (out != stdout)
+			fclose(out);
+		string_table_destroy(&ctx.strings);
+		symbol_set_destroy(&ctx.externs);
+		arm64_vararg_cache_destroy(&ctx);
+		hidden_function_aliases_destroy(&ctx);
+		arm64_obf_entries_destroy(&ctx);
+		return false;
+	}
 
 	if (out != stdout)
 		fclose(out);
@@ -3443,6 +3752,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	symbol_set_destroy(&ctx.externs);
 	arm64_vararg_cache_destroy(&ctx);
 	hidden_function_aliases_destroy(&ctx);
+	arm64_obf_entries_destroy(&ctx);
 	return true;
 }
 

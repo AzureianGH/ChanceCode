@@ -2616,9 +2616,7 @@ static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
 static void emit_function_prologue(X86FunctionContext *ctx)
 {
     const char *symbol = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
-    bool emit_global = true;
-    if (ctx->module && !ctx->module->keep_debug_names && ctx->fn && ctx->fn->is_hidden)
-        emit_global = false;
+    bool emit_global = ctx->fn && !ctx->fn->is_hidden;
     if (emit_global)
         fprintf(ctx->out, "%s %s\n", ctx->syntax->global_directive, symbol);
     fprintf(ctx->out, "%s:\n", symbol);

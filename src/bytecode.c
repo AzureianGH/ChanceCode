@@ -418,6 +418,62 @@ const char *cc_module_get_debug_file(const CCModule *module, uint32_t id)
     return module->debug_files ? module->debug_files[index] : NULL;
 }
 
+static void cc_instruction_strip_metadata(CCInstruction *ins)
+{
+    if (!ins)
+        return;
+    ins->line = 0;
+    ins->debug_file = 0;
+    ins->debug_line = 0;
+    ins->debug_column = 0;
+    if (ins->kind == CC_INSTR_CONST_STRING && ins->data.const_string.label_hint)
+    {
+        free(ins->data.const_string.label_hint);
+        ins->data.const_string.label_hint = NULL;
+    }
+}
+
+void cc_module_strip_metadata(CCModule *module)
+{
+    if (!module)
+        return;
+
+    if (module->debug_files)
+    {
+        for (size_t i = 0; i < module->debug_file_count; ++i)
+        {
+            free(module->debug_files[i]);
+            module->debug_files[i] = NULL;
+        }
+        free(module->debug_files);
+    }
+    module->debug_files = NULL;
+    module->debug_file_count = 0;
+    module->debug_file_capacity = 0;
+
+    for (size_t fi = 0; fi < module->function_count; ++fi)
+    {
+        CCFunction *fn = &module->functions[fi];
+        if (!fn || !fn->instructions)
+            continue;
+        size_t write_index = 0;
+        for (size_t ii = 0; ii < fn->instruction_count; ++ii)
+        {
+            CCInstruction *ins = &fn->instructions[ii];
+            cc_instruction_strip_metadata(ins);
+            if (ins->kind == CC_INSTR_COMMENT)
+            {
+                cc_instruction_free(ins);
+                continue;
+            }
+            if (write_index != ii)
+                memcpy(&fn->instructions[write_index], ins, sizeof(CCInstruction));
+            write_index++;
+        }
+        fn->instruction_count = write_index;
+    }
+}
+
 bool cc_function_set_param_types(CCFunction *function, const CCValueType *types, size_t count)
 {
     if (!function)
