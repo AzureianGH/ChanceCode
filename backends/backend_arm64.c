@@ -28,6 +28,61 @@ static const char *const ARM64_SCRATCH_GP_REGS32[] = {"w9", "w10", "w11", "w12"}
 #define ARM64_FRAME_REG "x27"
 #define ARM64_FRAME_REG32 "w27"
 
+typedef enum
+{
+	ARM64_OBJECT_MACHO = 0,
+	ARM64_OBJECT_ELF = 1
+} Arm64ObjectFormat;
+
+typedef struct
+{
+	Arm64ObjectFormat format;
+	const char *banner;
+	const char *text_section;
+	const char *data_section;
+	const char *const_section;
+	const char *cstring_section;
+	const char *string_label_hint_format;
+	const char *string_label_auto_format;
+	const char *target_os_option;
+	bool prefix_symbols_with_underscore;
+	const char *local_label_prefix;
+	bool emit_build_version;
+	const char *build_version_directive;
+} Arm64BackendConfig;
+
+static const Arm64BackendConfig kArm64ConfigMachO = {
+	.format = ARM64_OBJECT_MACHO,
+	.banner = "macOS",
+	.text_section = ".section __TEXT,__text,regular,pure_instructions",
+	.data_section = ".section __DATA,__data",
+	.const_section = ".section __DATA,__const",
+	.cstring_section = ".section __TEXT,__cstring",
+	.string_label_hint_format = "_%s__%s",
+	.string_label_auto_format = "L_str%zu",
+	.target_os_option = "macos",
+	.prefix_symbols_with_underscore = true,
+	.local_label_prefix = "L",
+	.emit_build_version = true,
+	.build_version_directive = ".build_version macos, 15, 0",
+};
+
+static const Arm64BackendConfig kArm64ConfigElf = {
+	.format = ARM64_OBJECT_ELF,
+	.banner = "Linux/ELF",
+	.text_section = ".text",
+	.data_section = ".data",
+	.const_section = ".section .rodata",
+	.cstring_section = ".section .rodata.str1.1,\"aMS\",@progbits,1",
+	.string_label_hint_format = ".L%s__%s",
+	.string_label_auto_format = ".Lstr%zu",
+	.target_os_option = "linux",
+	.prefix_symbols_with_underscore = false,
+	.local_label_prefix = ".L",
+	.emit_build_version = false,
+	.build_version_directive = NULL,
+};
+
 typedef struct
 {
 	char *label;
@@ -115,6 +170,7 @@ typedef struct
 {
 	FILE *out;
 	const CCModule *module;
+	const Arm64BackendConfig *config;
 	CCDiagnosticSink *sink;
 	Arm64StringTable strings;
 	Arm64SymbolSet externs;
@@ -194,6 +250,10 @@ static void arm64_obf_entries_destroy(Arm64ModuleContext *ctx);
 static uint32_t arm64_obfuscate_mix(uint32_t v);
 static uint32_t arm64_obfuscate_next(Arm64FunctionContext *ctx);
 static const char *arm64_obfuscate_select_register(Arm64FunctionContext *ctx);
+static const char *arm64_format_symbol(const Arm64ModuleContext *ctx, const char *name,
+									   char *buffer, size_t buffer_size);
+static void arm64_emit_symbol_address(const Arm64ModuleContext *ctx, FILE *out,
+									  const char *symbol, const char *dst_reg);
 
 typedef struct
 {
@@ -207,6 +267,9 @@ typedef struct
 	bool type_is_signed;
 	size_t spill_offset;
 	size_t spill_size;
+	bool uses_stack;
+	size_t stack_offset;
+	size_t stack_size;
 } Arm64ArgLocation;
 
 static bool arm64_spill_register_value(Arm64FunctionContext *ctx, Arm64Value *value, size_t stack_index);
@@ -313,6 +376,20 @@ static size_t align_up_size(size_t value, size_t alignment)
 	if (remainder == 0)
 		return value;
 	return value + (alignment - remainder);
+}
+
+static size_t arm64_assign_stack_slot(size_t *cursor, size_t size_bytes)
+{
+	if (!cursor)
+		return 0;
+	size_t slot_size = size_bytes ? size_bytes : 8;
+	if (slot_size <= 8)
+		slot_size = 8;
+	else
+		slot_size = align_up_size(slot_size, 8);
+	size_t offset = align_up_size(*cursor, 8);
+	*cursor = offset + slot_size;
+	return offset;
 }
 
 static size_t arm64_compute_max_stack_depth(const CCFunction *fn)
@@ -762,7 +839,8 @@ static bool arm64_emit_obf_support(Arm64ModuleContext *ctx)
 	FILE *out = ctx->out;
 	if (!out)
 		return false;
-	fprintf(out, ".section __DATA,__data\n");
+	const char *data_section = (ctx->config && ctx->config->data_section) ? ctx->config->data_section : ".data";
+	fprintf(out, "%s\n", data_section);
 	fprintf(out, ".p2align 3\n");
 	for (size_t i = 0; i < ctx->obf_entry_count; ++i)
 	{
@@ -773,7 +851,8 @@ static bool arm64_emit_obf_support(Arm64ModuleContext *ctx)
 		fprintf(out, "    .long %zu\n", entry->length);
 		fprintf(out, "    .quad %s\n", entry->str_label);
 	}
-	fprintf(out, ".section __TEXT,__const\n");
+	const char *const_section = (ctx->config && ctx->config->const_section) ? ctx->config->const_section : ".section __TEXT,__const";
+	fprintf(out, "%s\n", const_section);
 	for (size_t i = 0; i < ctx->obf_entry_count; ++i)
 	{
 		Arm64ObfEntry *entry = &ctx->obf_entries[i];
@@ -783,14 +862,14 @@ static bool arm64_emit_obf_support(Arm64ModuleContext *ctx)
 			fprintf(out, "    .byte 0x%02x\n", entry->encoded_bytes[b]);
 		}
 	}
-	fprintf(out, ".section __TEXT,__text,regular,pure_instructions\n");
+	const char *text_section = (ctx->config && ctx->config->text_section) ? ctx->config->text_section : ".section __TEXT,__text,regular,pure_instructions";
+	fprintf(out, "%s\n", text_section);
 	for (size_t i = 0; i < ctx->obf_entry_count; ++i)
 	{
 		Arm64ObfEntry *entry = &ctx->obf_entries[i];
 		fprintf(out, ".p2align 2\n");
 		fprintf(out, "%s:\n", entry->stub_label);
-		fprintf(out, "    adrp x16, %s@PAGE\n", entry->desc_label);
-		fprintf(out, "    add x16, x16, %s@PAGEOFF\n", entry->desc_label);
+		arm64_emit_symbol_address(ctx, out, entry->desc_label, "x16");
 		fprintf(out, "    b __cc_obf_call_gate\n\n");
 	}
 	fprintf(out, ".p2align 2\n");
@@ -827,13 +906,17 @@ static bool arm64_emit_obf_support(Arm64ModuleContext *ctx)
 	fprintf(out, "Lcc_obf_gate_decoded:\n");
 	fprintf(out, "    mov w17, wzr\n");
 	fprintf(out, "    strb w17, [x15]\n");
+	char dlsym_buf[32];
+	const char *dlsym_sym = arm64_format_symbol(ctx, "dlsym", dlsym_buf, sizeof(dlsym_buf));
 	fprintf(out, "    mov x0, #-2\n");
 	fprintf(out, "    mov x1, x14\n");
-	fprintf(out, "    bl _dlsym\n");
+	fprintf(out, "    bl %s\n", dlsym_sym ? dlsym_sym : "dlsym");
 	fprintf(out, "    mov x9, x0\n");
 	fprintf(out, "    add sp, sp, x20\n");
 	fprintf(out, "    cbnz x9, Lcc_obf_gate_cache\n");
-	fprintf(out, "    bl _abort\n");
+	char abort_buf[32];
+	const char *abort_sym = arm64_format_symbol(ctx, "abort", abort_buf, sizeof(abort_buf));
+	fprintf(out, "    bl %s\n", abort_sym ? abort_sym : "abort");
 	fprintf(out, "Lcc_obf_gate_cache:\n");
 	fprintf(out, "    str x9, [x19]\n");
 	fprintf(out, "Lcc_obf_gate_done:\n");
@@ -1056,39 +1139,56 @@ static bool function_stack_pop(Arm64FunctionContext *ctx, Arm64Value *value)
 	return true;
 }
 
-static bool is_macho_local_symbol(const char *name)
+static bool arm64_is_local_symbol(const Arm64ModuleContext *ctx, const char *name)
 {
-	if (!name || name[0] != 'L')
+	if (!ctx || !ctx->config || !name)
 		return false;
-	if (name[1] == '_')
-		return true;
-	if (name[1] == 'c' && name[2] == 'c' && name[3] == '_')
-		return true;
-	return false;
+	if (ctx->config->format == ARM64_OBJECT_MACHO)
+	{
+		if (name[0] != 'L')
+			return false;
+		if (name[1] == '_')
+			return true;
+		if (name[1] == 'c' && name[2] == 'c' && name[3] == '_')
+			return true;
+		const char *double_underscore = strstr(name, "__");
+		return double_underscore != NULL;
+	}
+	return (name[0] == '.' && name[1] == 'L');
 }
 
-static const char *symbol_with_underscore(const char *name, char *buffer, size_t buffer_size)
+static const char *arm64_format_symbol(const Arm64ModuleContext *ctx, const char *name, char *buffer, size_t buffer_size)
 {
-	if (!name || buffer_size == 0)
+	if (!buffer || buffer_size == 0)
 		return NULL;
-	if (is_macho_local_symbol(name))
+	if (!name)
 	{
-		snprintf(buffer, buffer_size, "%s", name);
+		buffer[0] = '\0';
 		return buffer;
 	}
-	snprintf(buffer, buffer_size, "_%s", name);
+	if (ctx && ctx->config && ctx->config->prefix_symbols_with_underscore && name[0] != '_' && !arm64_is_local_symbol(ctx, name))
+		snprintf(buffer, buffer_size, "_%s", name);
+	else
+		snprintf(buffer, buffer_size, "%s", name);
 	return buffer;
 }
 
-static void arm64_emit_symbol_address(FILE *out, const char *symbol, const char *dst_reg)
+static void arm64_emit_symbol_address(const Arm64ModuleContext *ctx, FILE *out, const char *symbol, const char *dst_reg)
 {
-	if (!out || !symbol || !dst_reg)
+	if (!ctx || !out || !symbol || !dst_reg)
 		return;
 	char symbol_buf[256];
-	const char *sym = symbol_with_underscore(symbol, symbol_buf, sizeof(symbol_buf));
-	const char *label = sym ? sym : symbol;
-	fprintf(out, "    adrp %s, %s@PAGE\n", dst_reg, label);
-	fprintf(out, "    add %s, %s, %s@PAGEOFF\n", dst_reg, dst_reg, label);
+	const char *label = arm64_format_symbol(ctx, symbol, symbol_buf, sizeof(symbol_buf));
+	if (ctx->config && ctx->config->format == ARM64_OBJECT_MACHO)
+	{
+		fprintf(out, "    adrp %s, %s@PAGE\n", dst_reg, label);
+		fprintf(out, "    add %s, %s, %s@PAGEOFF\n", dst_reg, dst_reg, label);
+	}
+	else
+	{
+		fprintf(out, "    adrp %s, %s\n", dst_reg, label);
+		fprintf(out, "    add %s, %s, :lo12:%s\n", dst_reg, dst_reg, label);
+	}
 }
 
 static const char *arm64_local_label_name(Arm64FunctionContext *ctx, const char *suffix, char *buffer, size_t buffer_size)
@@ -1100,9 +1200,12 @@ static const char *arm64_local_label_name(Arm64FunctionContext *ctx, const char 
 	const char *symbol = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
 	if (!symbol || !buffer || buffer_size == 0)
 		return NULL;
-	bool needs_prefix = ctx->prefix_labels && !is_macho_local_symbol(symbol);
+	Arm64ModuleContext *module = ctx->module;
+	const Arm64BackendConfig *cfg = module ? module->config : NULL;
+	const char *local_prefix = (cfg && cfg->local_label_prefix) ? cfg->local_label_prefix : "L";
+	bool needs_prefix = ctx->prefix_labels && (!module || !arm64_is_local_symbol(module, symbol));
 	if (needs_prefix)
-		snprintf(buffer, buffer_size, "L%s__%s", symbol, suffix);
+		snprintf(buffer, buffer_size, "%s%s__%s", local_prefix, symbol, suffix);
 	else
 		snprintf(buffer, buffer_size, "%s__%s", symbol, suffix);
 	return buffer;
@@ -1217,14 +1320,12 @@ static bool arm64_materialize_gp(Arm64FunctionContext *ctx, Arm64Value *value, c
 	case ARM64_VALUE_LABEL:
 		if (use_w)
 		{
-			fprintf(out, "    adrp x9, %s@PAGE\n", value->data.label);
-			fprintf(out, "    add x9, x9, %s@PAGEOFF\n", value->data.label);
+			arm64_emit_symbol_address(ctx->module, out, value->data.label, "x9");
 			fprintf(out, "    mov %s, w9\n", reg);
 		}
 		else
 		{
-			fprintf(out, "    adrp %s, %s@PAGE\n", reg, value->data.label);
-			fprintf(out, "    add %s, %s, %s@PAGEOFF\n", reg, reg, value->data.label);
+			arm64_emit_symbol_address(ctx->module, out, value->data.label, reg);
 		}
 		return true;
 	case ARM64_VALUE_REGISTER:
@@ -1684,11 +1785,22 @@ static const char *arm64_intern_string(Arm64FunctionContext *ctx, const CCInstru
 	if (!ctx || !ctx->module)
 		return NULL;
 	char label[256];
+	Arm64ModuleContext *module = ctx->module;
+	const Arm64BackendConfig *cfg = module ? module->config : NULL;
+	const char *hint_fmt = (cfg && cfg->string_label_hint_format) ? cfg->string_label_hint_format : "%s__%s";
+	const char *auto_fmt = (cfg && cfg->string_label_auto_format) ? cfg->string_label_auto_format : "L_str%zu";
 	const char *fn_symbol = ctx->symbol_name ? ctx->symbol_name : (ctx->fn ? ctx->fn->name : NULL);
-	if (ins->data.const_string.label_hint && ins->data.const_string.label_hint[0] && fn_symbol && *fn_symbol)
-		snprintf(label, sizeof(label), "_%s__%s", fn_symbol, ins->data.const_string.label_hint);
+	char fn_buf[256];
+	const char *formatted = NULL;
+	if (fn_symbol && module)
+		formatted = arm64_format_symbol(module, fn_symbol, fn_buf, sizeof(fn_buf));
+	if (ins->data.const_string.label_hint && ins->data.const_string.label_hint[0] && formatted && *formatted)
+		snprintf(label, sizeof(label), hint_fmt, formatted, ins->data.const_string.label_hint);
 	else
-		snprintf(label, sizeof(label), "L_str%zu", ctx->module->string_counter++);
+	{
+		size_t ordinal = module ? module->string_counter++ : 0;
+		snprintf(label, sizeof(label), auto_fmt, ordinal);
+	}
 	if (!string_table_add(&ctx->module->strings, label, ins->data.const_string.bytes, ins->data.const_string.length))
 		return NULL;
 	return ctx->module->strings.items[ctx->module->strings.count - 1].label;
@@ -1759,7 +1871,7 @@ static bool arm64_emit_load_global(Arm64FunctionContext *ctx, const CCInstructio
 	const char *symbol = ins->data.global.symbol;
 	if (ctx->module && module_has_function(ctx->module->module, symbol))
 		symbol = arm64_module_symbol_alias(ctx->module, symbol);
-	arm64_emit_symbol_address(out, symbol, addr_reg);
+	arm64_emit_symbol_address(ctx->module, out, symbol, addr_reg);
 	CCValueType type = ins->data.global.type;
 	Arm64Value result;
 	memset(&result, 0, sizeof(result));
@@ -1851,7 +1963,7 @@ static bool arm64_emit_store_global(Arm64FunctionContext *ctx, const CCInstructi
 	const char *symbol = ins->data.global.symbol;
 	if (ctx->module && module_has_function(ctx->module->module, symbol))
 		symbol = arm64_module_symbol_alias(ctx->module, symbol);
-	arm64_emit_symbol_address(out, symbol, addr_reg);
+	arm64_emit_symbol_address(ctx->module, out, symbol, addr_reg);
 	CCValueType type = ins->data.global.type;
 	if (cc_value_type_is_float(type))
 	{
@@ -1888,7 +2000,7 @@ static bool arm64_emit_addr_global(Arm64FunctionContext *ctx, const CCInstructio
 	const char *symbol = ins->data.global.symbol;
 	if (ctx->module && module_has_function(ctx->module->module, symbol))
 		symbol = arm64_module_symbol_alias(ctx->module, symbol);
-	arm64_emit_symbol_address(out, symbol, dst_reg);
+	arm64_emit_symbol_address(ctx->module, out, symbol, dst_reg);
 	Arm64Value value;
 	memset(&value, 0, sizeof(value));
 	value.kind = ARM64_VALUE_REGISTER;
@@ -2751,9 +2863,12 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	}
 	size_t gp_used = 0;
 	size_t fp_used = 0;
+	size_t stack_arg_cursor = 0;
+	size_t stack_arg_total = 0;
 	Arm64ArgLocation *locations = NULL;
 	bool success = false;
 	size_t stack_spill_total = 0;
+	size_t total_stack_adjust = 0;
 	size_t arg_base = ctx->stack_size - arg_count;
 	for (size_t i = 0; i < arg_base; ++i)
 	{
@@ -2801,77 +2916,116 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 
 		if (is_float)
 		{
-			if (fp_used >= sizeof(ARM64_FP_REGS) / sizeof(ARM64_FP_REGS[0]))
-			{
-				emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "floating argument spill not supported on arm64 backend");
-				goto cleanup;
-			}
+			const size_t fp_reg_limit = sizeof(ARM64_FP_REGS) / sizeof(ARM64_FP_REGS[0]);
 			const bool use_s = (arg_type == CC_TYPE_F32);
-			const char *reg64 = ARM64_FP_REGS[fp_used];
-			char reg32_buf[8];
-			const char *target_reg = reg64;
-			if (use_s)
+			if (fp_used < fp_reg_limit)
 			{
-				snprintf(reg32_buf, sizeof(reg32_buf), "s%s", reg64 + 1);
-				target_reg = reg32_buf;
-			}
-			if (!arm64_materialize_fp(ctx, value, target_reg, arg_type))
-				goto cleanup;
-			if (loc)
-			{
-				loc->uses_fp_reg = true;
-				loc->fp_reg_index = fp_used;
-				loc->fp_is_s = use_s;
-				loc->type = arg_type;
-				loc->type_is_signed = false;
-			}
-			if (is_vararg_arg)
-			{
-				if (gp_used >= sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]))
-				{
-					emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend cannot mirror vararg float into GP register (ran out of x regs)");
-					goto cleanup;
-				}
-				const size_t gp_index = gp_used++;
-				const char *gp_reg64 = ARM64_GP_REGS64[gp_index];
-				const char *gp_reg32 = ARM64_GP_REGS32[gp_index];
+				const char *reg64 = ARM64_FP_REGS[fp_used];
+				char reg32_buf[8];
+				const char *target_reg = reg64;
 				if (use_s)
-					fprintf(ctx->out, "    fmov %s, %s\n", gp_reg32, target_reg);
-				else
-					fprintf(ctx->out, "    fmov %s, %s\n", gp_reg64, target_reg);
+				{
+					snprintf(reg32_buf, sizeof(reg32_buf), "s%s", reg64 + 1);
+					target_reg = reg32_buf;
+				}
+				if (!arm64_materialize_fp(ctx, value, target_reg, arg_type))
+					goto cleanup;
 				if (loc)
 				{
-					loc->uses_gp_reg = true;
-					loc->gp_is_w = false;
-					loc->gp_reg_index = gp_index;
+					loc->uses_fp_reg = true;
+					loc->fp_reg_index = fp_used;
+					loc->fp_is_s = use_s;
 					loc->type = arg_type;
 					loc->type_is_signed = false;
 				}
+				if (is_vararg_arg)
+				{
+					if (gp_used >= sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]))
+					{
+						emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend cannot mirror vararg float into GP register (ran out of x regs)");
+						goto cleanup;
+					}
+					const size_t gp_index = gp_used++;
+					const char *gp_reg64 = ARM64_GP_REGS64[gp_index];
+					const char *gp_reg32 = ARM64_GP_REGS32[gp_index];
+					if (use_s)
+						fprintf(ctx->out, "    fmov %s, %s\n", gp_reg32, target_reg);
+					else
+						fprintf(ctx->out, "    fmov %s, %s\n", gp_reg64, target_reg);
+					if (loc)
+					{
+						loc->uses_gp_reg = true;
+						loc->gp_is_w = false;
+						loc->gp_reg_index = gp_index;
+						loc->type = arg_type;
+						loc->type_is_signed = false;
+					}
+				}
+				fp_used++;
 			}
-			fp_used++;
+			else
+			{
+				size_t value_size = arm64_type_size(arg_type);
+				if (value_size == 0)
+					value_size = use_s ? 4 : 8;
+				if (value_size > 8)
+				{
+					emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend does not yet support stack-passed floating arguments larger than 8 bytes");
+					goto cleanup;
+				}
+				if (loc)
+				{
+					loc->uses_stack = true;
+					loc->type = arg_type;
+					loc->type_is_signed = false;
+					loc->stack_size = value_size;
+					loc->stack_offset = arm64_assign_stack_slot(&stack_arg_cursor, value_size);
+				}
+				continue;
+			}
 		}
 		else
 		{
-			if (gp_used >= sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]))
-			{
-				emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "more than 8 integer arguments not supported yet");
-				goto cleanup;
-			}
+			const size_t gp_reg_limit = sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]);
 			bool use_w = (arg_type == CC_TYPE_I32 || arg_type == CC_TYPE_U32 || arg_type == CC_TYPE_I16 || arg_type == CC_TYPE_U16 || arg_type == CC_TYPE_I8 || arg_type == CC_TYPE_U8 || arg_type == CC_TYPE_I1);
-			const char *reg = use_w ? ARM64_GP_REGS32[gp_used] : ARM64_GP_REGS64[gp_used];
-			if (!arm64_materialize_gp(ctx, value, reg, use_w))
-				goto cleanup;
-			if (loc)
+			if (gp_used < gp_reg_limit)
 			{
-				loc->uses_gp_reg = true;
-				loc->gp_is_w = use_w;
-				loc->gp_reg_index = gp_used;
-				loc->type = arg_type;
-				loc->type_is_signed = cc_value_type_is_signed(arg_type);
+				const char *reg = use_w ? ARM64_GP_REGS32[gp_used] : ARM64_GP_REGS64[gp_used];
+				if (!arm64_materialize_gp(ctx, value, reg, use_w))
+					goto cleanup;
+				if (loc)
+				{
+					loc->uses_gp_reg = true;
+					loc->gp_is_w = use_w;
+					loc->gp_reg_index = gp_used;
+					loc->type = arg_type;
+					loc->type_is_signed = cc_value_type_is_signed(arg_type);
+				}
+				gp_used++;
 			}
-			gp_used++;
+			else
+			{
+				size_t value_size = arm64_type_size(arg_type);
+				if (value_size == 0)
+					value_size = 8;
+				if (value_size > 8)
+				{
+					emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend does not yet support stack-passed integer arguments larger than 8 bytes");
+					goto cleanup;
+				}
+				if (loc)
+				{
+					loc->uses_stack = true;
+					loc->type = arg_type;
+					loc->type_is_signed = cc_value_type_is_signed(arg_type);
+					loc->stack_size = value_size;
+					loc->stack_offset = arm64_assign_stack_slot(&stack_arg_cursor, value_size);
+				}
+			}
 		}
 	}
+
+	stack_arg_total = align_up_size(stack_arg_cursor, ARM64_STACK_ALIGNMENT);
 
 	if (call_declares_varargs)
 	{
@@ -2894,9 +3048,13 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		for (size_t i = fixed_params; i < arg_count; ++i)
 		{
 			Arm64ArgLocation *loc = &locations[i];
-			if (!loc || (!loc->uses_gp_reg && !loc->uses_fp_reg))
+			if (!loc)
+				continue;
+			if (loc->uses_stack)
+				continue;
+			if (!loc->uses_gp_reg && !loc->uses_fp_reg)
 			{
-				emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend does not yet support spilling stack-only varargs");
+				emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend cannot mirror vararg argument with unknown location");
 				goto cleanup;
 			}
 
@@ -2918,35 +3076,72 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		}
 
 		stack_spill_total = align_up_size(spill_cursor, ARM64_STACK_ALIGNMENT);
-		if (stack_spill_total > 0)
+	}
+
+	total_stack_adjust = stack_arg_total + stack_spill_total;
+	if (total_stack_adjust > 0)
+		fprintf(ctx->out, "    sub sp, sp, #%zu\n", total_stack_adjust);
+
+	if (stack_arg_total > 0)
+	{
+		for (size_t i = 0; i < arg_count; ++i)
 		{
-			fprintf(ctx->out, "    sub sp, sp, #%zu\n", stack_spill_total);
-			for (size_t i = fixed_params; i < arg_count; ++i)
+			Arm64ArgLocation *loc = &locations[i];
+			if (!loc || !loc->uses_stack)
+				continue;
+			Arm64Value *value = &ctx->stack[arg_base + i];
+			size_t addr = loc->stack_offset;
+			if (cc_value_type_is_float(loc->type))
 			{
-				Arm64ArgLocation *loc = &locations[i];
-				if (!loc)
-					continue;
+				const char *fp_reg = (loc->type == CC_TYPE_F32) ? "s15" : "d15";
+				if (!arm64_materialize_fp(ctx, value, fp_reg, loc->type))
+					goto cleanup;
+				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", fp_reg, addr);
+			}
+			else
+			{
+				size_t size_bytes = arm64_type_size(loc->type);
+				if (size_bytes == 0)
+					size_bytes = 8;
+				const char *xreg = ARM64_SCRATCH_GP_REGS64[0];
+				const char *wreg = ARM64_SCRATCH_GP_REGS32[0];
+				bool use_w = (size_bytes <= 4);
+				if (!arm64_materialize_gp(ctx, value, use_w ? wreg : xreg, use_w))
+					goto cleanup;
+				if (size_bytes >= 8)
+					fprintf(ctx->out, "    str %s, [sp, #%zu]\n", xreg, addr);
+				else if (size_bytes == 4)
+					fprintf(ctx->out, "    str %s, [sp, #%zu]\n", wreg, addr);
+				else if (size_bytes == 2)
+					fprintf(ctx->out, "    strh %s, [sp, #%zu]\n", wreg, addr);
+				else
+					fprintf(ctx->out, "    strb %s, [sp, #%zu]\n", wreg, addr);
+			}
+		}
+	}
 
-				if (loc->uses_gp_reg)
-				{
-					const char *xreg = ARM64_GP_REGS64[loc->gp_reg_index];
-					const char *wreg = ARM64_GP_REGS32[loc->gp_reg_index];
-					if (loc->gp_is_w && loc->type_is_signed)
-						fprintf(ctx->out, "    sxtw %s, %s\n", xreg, wreg);
-
-					if (loc->spill_offset == 0)
-						fprintf(ctx->out, "    str %s, [sp]\n", xreg);
-					else
-						fprintf(ctx->out, "    str %s, [sp, #%zu]\n", xreg, loc->spill_offset);
-				}
-				else if (loc->uses_fp_reg)
-				{
-					const char *dreg = ARM64_FP_REGS[loc->fp_reg_index];
-					if (loc->spill_offset == 0)
-						fprintf(ctx->out, "    str %s, [sp]\n", dreg);
-					else
-						fprintf(ctx->out, "    str %s, [sp, #%zu]\n", dreg, loc->spill_offset);
-				}
+	if (call_declares_varargs && stack_spill_total > 0)
+	{
+		size_t spill_base = stack_arg_total;
+		for (size_t i = fixed_params; i < arg_count; ++i)
+		{
+			Arm64ArgLocation *loc = &locations[i];
+			if (!loc || loc->uses_stack)
+				continue;
+			size_t addr = spill_base + loc->spill_offset;
+			if (loc->uses_gp_reg)
+			{
+				const char *xreg = ARM64_GP_REGS64[loc->gp_reg_index];
+				const char *wreg = ARM64_GP_REGS32[loc->gp_reg_index];
+				if (loc->gp_is_w && loc->type_is_signed)
+					fprintf(ctx->out, "    sxtw %s, %s\n", xreg, wreg);
+				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", xreg, addr);
+			}
+			else if (loc->uses_fp_reg)
+			{
+				const char *dreg = ARM64_FP_REGS[loc->fp_reg_index];
+				const char *sreg = ARM64_FP_REGS32[loc->fp_reg_index];
+				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", loc->fp_is_s ? sreg : dreg, addr);
 			}
 		}
 	}
@@ -2957,7 +3152,9 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		const char *mapped = arm64_module_symbol_alias(ctx->module, ins->data.call.symbol);
 		const char *symbol_name = mapped ? mapped : ins->data.call.symbol;
 		char symbol_buf[256];
-		const char *sym = symbol_with_underscore(symbol_name, symbol_buf, sizeof(symbol_buf));
+		const char *sym = (ctx->module && symbol_name)
+							  ? arm64_format_symbol(ctx->module, symbol_name, symbol_buf, sizeof(symbol_buf))
+							  : symbol_name;
 		const char *visible = sym ? sym : symbol_name;
 		if (ctx->module->obfuscate_calls && !target_is_internal)
 		{
@@ -2969,8 +3166,7 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		else if (ctx->module->obfuscate_calls && target_is_internal)
 		{
 			const char *target_reg = arm64_obfuscate_select_register(ctx);
-			fprintf(ctx->out, "    adrp %s, %s@PAGE\n", target_reg, visible);
-			fprintf(ctx->out, "    add %s, %s, %s@PAGEOFF\n", target_reg, target_reg, visible);
+			arm64_emit_symbol_address(ctx->module, ctx->out, visible, target_reg);
 			fprintf(ctx->out, "    blr %s\n", target_reg);
 		}
 		else
@@ -2993,8 +3189,8 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		fprintf(ctx->out, "    blr %s\n", target_reg);
 	}
 
-	if (stack_spill_total > 0)
-		fprintf(ctx->out, "    add sp, sp, #%zu\n", stack_spill_total);
+	if (total_stack_adjust > 0)
+		fprintf(ctx->out, "    add sp, sp, #%zu\n", total_stack_adjust);
 
 	ctx->stack_size -= arg_count;
 
@@ -3132,7 +3328,7 @@ static bool arm64_emit_literal_function(Arm64FunctionContext *ctx)
 	}
 	const char *export_name = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
 	char symbol_buf[256];
-	const char *fn_symbol = export_name ? symbol_with_underscore(export_name, symbol_buf, sizeof(symbol_buf)) : NULL;
+	const char *fn_symbol = (export_name && ctx->module) ? arm64_format_symbol(ctx->module, export_name, symbol_buf, sizeof(symbol_buf)) : NULL;
 	const char *visible = fn_symbol ? fn_symbol : (export_name ? export_name : "__cc_literal");
 	if (!ctx->fn->is_hidden)
 		fprintf(ctx->out, ".globl %s\n", visible);
@@ -3239,7 +3435,7 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 
 	const char *export_name = ctx->symbol_name ? ctx->symbol_name : ctx->fn->name;
 	char symbol_buf[256];
-	const char *fn_symbol = export_name ? symbol_with_underscore(export_name, symbol_buf, sizeof(symbol_buf)) : NULL;
+	const char *fn_symbol = (export_name && ctx->module) ? arm64_format_symbol(ctx->module, export_name, symbol_buf, sizeof(symbol_buf)) : NULL;
 	const char *visible = fn_symbol ? fn_symbol : (export_name ? export_name : "__cc_fn");
 	if (!ctx->fn->is_hidden)
 		fprintf(ctx->out, ".globl %s\n", visible);
@@ -3254,6 +3450,7 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 
 	size_t gp_param_index = 0;
 	size_t fp_param_index = 0;
+	size_t incoming_stack_cursor = 0;
 	for (size_t i = 0; i < param_count; ++i)
 	{
 		CCValueType param_type = ctx->param_types[i];
@@ -3263,59 +3460,97 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 		size_t size_bytes = arm64_type_size(param_type);
 		if (is_float)
 		{
-			if (fp_param_index >= sizeof(ARM64_FP_REGS) / sizeof(ARM64_FP_REGS[0]))
+			const size_t fp_limit = sizeof(ARM64_FP_REGS) / sizeof(ARM64_FP_REGS[0]);
+			if (fp_param_index < fp_limit)
 			{
-
-				emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "arm64 backend only supports up to 8 floating parameters presently");
+				if (size_bytes == 4)
+					fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_FP_REGS32[fp_param_index], ARM64_FRAME_REG, addr);
+				else
+					fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_FP_REGS[fp_param_index], ARM64_FRAME_REG, addr);
+				fp_param_index++;
+				continue;
+			}
+			if (size_bytes > 8)
+			{
+				emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "arm64 backend does not yet support stack-passed floating parameters larger than 8 bytes");
 				goto fail;
 			}
-			if (size_bytes == 4)
-				fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_FP_REGS32[fp_param_index], ARM64_FRAME_REG, addr);
-			else
-				fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_FP_REGS[fp_param_index], ARM64_FRAME_REG, addr);
-			fp_param_index++;
+			const size_t stack_offset = arm64_assign_stack_slot(&incoming_stack_cursor, size_bytes);
+			const size_t load_addr = 16 + stack_offset;
+			const char *tmp_fp = (size_bytes == 4) ? "s15" : "d15";
+			fprintf(ctx->out, "    ldr %s, [x29, #%zu]\n", tmp_fp, load_addr);
+			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", tmp_fp, ARM64_FRAME_REG, addr);
 			continue;
 		}
 
-		if (gp_param_index >= sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]))
+		const size_t gp_limit = sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]);
+		if (gp_param_index < gp_limit)
 		{
-			emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "arm64 backend only supports up to 8 integer parameters presently");
+			if (size_bytes == 1)
+				fprintf(ctx->out, "    strb %s, [%s, #%zu]\n", ARM64_GP_REGS32[gp_param_index], ARM64_FRAME_REG, addr);
+			else if (size_bytes == 2)
+				fprintf(ctx->out, "    strh %s, [%s, #%zu]\n", ARM64_GP_REGS32[gp_param_index], ARM64_FRAME_REG, addr);
+			else if (size_bytes == 4)
+				fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_GP_REGS32[gp_param_index], ARM64_FRAME_REG, addr);
+			else
+				fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_GP_REGS64[gp_param_index], ARM64_FRAME_REG, addr);
+			gp_param_index++;
+			continue;
+		}
+		if (size_bytes > 8)
+		{
+			emit_diag(ctx->sink, CC_DIAG_ERROR, 0, "arm64 backend does not yet support stack-passed integer parameters larger than 8 bytes");
 			goto fail;
 		}
-		if (size_bytes == 1)
-			fprintf(ctx->out, "    strb %s, [%s, #%zu]\n", ARM64_GP_REGS32[gp_param_index], ARM64_FRAME_REG, addr);
-		else if (size_bytes == 2)
-			fprintf(ctx->out, "    strh %s, [%s, #%zu]\n", ARM64_GP_REGS32[gp_param_index], ARM64_FRAME_REG, addr);
+		const size_t stack_offset = arm64_assign_stack_slot(&incoming_stack_cursor, size_bytes);
+		const size_t load_addr = 16 + stack_offset;
+		const char *xreg = ARM64_SCRATCH_GP_REGS64[0];
+		const char *wreg = ARM64_SCRATCH_GP_REGS32[0];
+		if (size_bytes >= 8)
+		{
+			fprintf(ctx->out, "    ldr %s, [x29, #%zu]\n", xreg, load_addr);
+			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", xreg, ARM64_FRAME_REG, addr);
+		}
 		else if (size_bytes == 4)
-			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_GP_REGS32[gp_param_index], ARM64_FRAME_REG, addr);
+		{
+			fprintf(ctx->out, "    ldr %s, [x29, #%zu]\n", wreg, load_addr);
+			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", wreg, ARM64_FRAME_REG, addr);
+		}
+		else if (size_bytes == 2)
+		{
+			fprintf(ctx->out, "    ldrh %s, [x29, #%zu]\n", wreg, load_addr);
+			fprintf(ctx->out, "    strh %s, [%s, #%zu]\n", wreg, ARM64_FRAME_REG, addr);
+		}
 		else
-			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_GP_REGS64[gp_param_index], ARM64_FRAME_REG, addr);
-		gp_param_index++;
+		{
+			fprintf(ctx->out, "    ldrb %s, [x29, #%zu]\n", wreg, load_addr);
+			fprintf(ctx->out, "    strb %s, [%s, #%zu]\n", wreg, ARM64_FRAME_REG, addr);
+		}
 	}
 
-		if (ctx->has_vararg_area)
+	if (ctx->has_vararg_area)
+	{
+		ctx->vararg_gp_start = gp_param_index;
+		size_t base_offset = ctx->vararg_area_offset;
+		size_t gp_reg_count = sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]);
+
+		// Spill General Purpose Registers (x0-x7)
+		for (size_t reg = 0; reg < gp_reg_count; ++reg)
 		{
-			ctx->vararg_gp_start = gp_param_index;
-			size_t base_offset = ctx->vararg_area_offset;
-			size_t gp_reg_count = sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]);
-			
-			// Spill General Purpose Registers (x0-x7)
-			for (size_t reg = 0; reg < gp_reg_count; ++reg)
-			{
-				size_t addr = arm64_frame_offset(ctx, base_offset + reg * 8);
-				fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_GP_REGS64[reg], ARM64_FRAME_REG, addr);
-			}
-			
-			// Spill Floating Point Registers (d0-d7)
-			// These follow immediately after the 8 GPRs (8 * 8 = 64 bytes offset)
-			size_t fp_base_offset = base_offset + (gp_reg_count * 8);
-			size_t fp_reg_count = sizeof(ARM64_FP_REGS) / sizeof(ARM64_FP_REGS[0]);
-			for (size_t reg = 0; reg < fp_reg_count; ++reg)
-			{
-				size_t addr = arm64_frame_offset(ctx, fp_base_offset + reg * 8);
-				fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_FP_REGS[reg], ARM64_FRAME_REG, addr);
-			}
+			size_t addr = arm64_frame_offset(ctx, base_offset + reg * 8);
+			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_GP_REGS64[reg], ARM64_FRAME_REG, addr);
 		}
+
+		// Spill Floating Point Registers (d0-d7)
+		// These follow immediately after the 8 GPRs (8 * 8 = 64 bytes offset)
+		size_t fp_base_offset = base_offset + (gp_reg_count * 8);
+		size_t fp_reg_count = sizeof(ARM64_FP_REGS) / sizeof(ARM64_FP_REGS[0]);
+		for (size_t reg = 0; reg < fp_reg_count; ++reg)
+		{
+			size_t addr = arm64_frame_offset(ctx, fp_base_offset + reg * 8);
+			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_FP_REGS[reg], ARM64_FRAME_REG, addr);
+		}
+	}
 
 	for (size_t i = 0; i < ctx->fn->instruction_count; ++i)
 	{
@@ -3379,7 +3614,8 @@ static void arm64_emit_string_literals(const Arm64ModuleContext *ctx)
 {
 	if (!ctx || ctx->strings.count == 0)
 		return;
-	fprintf(ctx->out, "\n.section __TEXT,__cstring\n");
+	const char *section = (ctx->config && ctx->config->cstring_section) ? ctx->config->cstring_section : ".section __TEXT,__cstring";
+	fprintf(ctx->out, "\n%s\n", section);
 	for (size_t i = 0; i < ctx->strings.count; ++i)
 	{
 		const Arm64StringLiteral *lit = &ctx->strings.items[i];
@@ -3411,7 +3647,7 @@ static bool arm64_collect_externs(Arm64ModuleContext *ctx)
 				if (module_has_function(ctx->module, ins->data.call.symbol))
 					continue;
 				char symbol_buf[256];
-				const char *sym = symbol_with_underscore(ins->data.call.symbol, symbol_buf, sizeof(symbol_buf));
+				const char *sym = ctx->module ? arm64_format_symbol(ctx, ins->data.call.symbol, symbol_buf, sizeof(symbol_buf)) : ins->data.call.symbol;
 				if (!symbol_set_add(&ctx->externs, sym ? sym : ins->data.call.symbol))
 					return false;
 			}
@@ -3457,11 +3693,11 @@ static size_t arm64_global_storage_size(const CCGlobal *global)
 
 static void arm64_emit_global_definition(const Arm64ModuleContext *ctx, const CCGlobal *global)
 {
-	if (!ctx || !ctx->out || !global || !global->name)
+	if (!ctx || !ctx->out || !global || !global->name || global->is_extern)
 		return;
 	FILE *out = ctx->out;
 	char symbol_buf[256];
-	const char *symbol = symbol_with_underscore(global->name, symbol_buf, sizeof(symbol_buf));
+	const char *symbol = arm64_format_symbol(ctx, global->name, symbol_buf, sizeof(symbol_buf));
 	size_t align_bytes = global->alignment ? global->alignment : arm64_type_size(global->type);
 	if (align_bytes == 0)
 		align_bytes = 8;
@@ -3470,7 +3706,8 @@ static void arm64_emit_global_definition(const Arm64ModuleContext *ctx, const CC
 	if (storage_size == 0)
 		storage_size = 8;
 
-	fprintf(out, ".globl %s\n", symbol ? symbol : global->name);
+	if (!global->is_hidden)
+		fprintf(out, ".globl %s\n", symbol ? symbol : global->name);
 	fprintf(out, ".p2align %u\n", align_shift);
 	fprintf(out, "%s:\n", symbol ? symbol : global->name);
 
@@ -3588,7 +3825,12 @@ static void arm64_emit_globals(const Arm64ModuleContext *ctx)
 		int desired_section = global->is_const ? 1 : 0;
 		if (desired_section != current_section)
 		{
-			fprintf(ctx->out, "\n.section __DATA,%s\n", desired_section ? "__const" : "__data");
+			const char *section = NULL;
+			if (ctx->config)
+				section = desired_section ? ctx->config->const_section : ctx->config->data_section;
+			if (!section)
+				section = desired_section ? ".section .rodata" : ".data";
+			fprintf(ctx->out, "\n%s\n", section);
 			current_section = desired_section;
 		}
 		arm64_emit_global_definition(ctx, global);
@@ -3630,22 +3872,33 @@ static void arm64_emit_debug_files(const Arm64ModuleContext *ctx)
 
 static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, const CCBackendOptions *options, CCDiagnosticSink *sink, void *userdata)
 {
-	(void)backend;
-	(void)options;
 	(void)userdata;
 	if (!module)
 		return false;
 
+	const Arm64BackendConfig *config = backend && backend->userdata ? (const Arm64BackendConfig *)backend->userdata : &kArm64ConfigMachO;
 	const char *output_path = backend_option_get(options, "output");
 	const char *target_os = backend_option_get(options, "target-os");
 	const char *debug_opt = backend_option_get(options, "debug");
 	const char *strip_opt = backend_option_get(options, "strip");
 	const char *obfuscate_opt = backend_option_get(options, "obfuscate");
 
-	if (target_os && target_os[0] && !equals_ignore_case(target_os, "macos"))
+	if (config && config->target_os_option)
 	{
-		emit_diag(sink, CC_DIAG_ERROR, 0, "arm64 backend only supports target-os=macos (got '%s')", target_os);
-		return false;
+		if (target_os && *target_os)
+		{
+			if (!equals_ignore_case(target_os, config->target_os_option))
+			{
+				emit_diag(sink, CC_DIAG_ERROR, 0,
+						  "arm64 backend requires target-os=%s (got '%s')",
+						  config->target_os_option, target_os);
+				return false;
+			}
+		}
+		else
+		{
+			target_os = config->target_os_option;
+		}
 	}
 
 	FILE *out = stdout;
@@ -3663,6 +3916,7 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.out = out;
 	ctx.module = module;
+	ctx.config = config;
 	ctx.sink = sink;
 	ctx.keep_debug_names = option_is_enabled(debug_opt);
 	ctx.prefer_local_hidden_symbols = option_is_enabled(strip_opt);
@@ -3675,13 +3929,22 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 		ctx.obfuscate_seed ^= 0xa0761d65u;
 	else
 	{
-		symbol_set_add(&ctx.externs, "_dlsym");
-		symbol_set_add(&ctx.externs, "_abort");
+		const char *runtime_syms[] = {"dlsym", "abort"};
+		for (size_t i = 0; i < sizeof(runtime_syms) / sizeof(runtime_syms[0]); ++i)
+		{
+			char runtime_buf[64];
+			const char *rt = arm64_format_symbol(&ctx, runtime_syms[i], runtime_buf, sizeof(runtime_buf));
+			symbol_set_add(&ctx.externs, rt ? rt : runtime_syms[i]);
+		}
 	}
 	arm64_vararg_cache_load(&ctx);
 
-	fprintf(out, "// ChanceCode macOS ARM64 backend output\n");
-	fprintf(out, ".build_version macos, 15, 0\n\n");
+	const char *banner = (config && config->banner) ? config->banner : "ARM64";
+	fprintf(out, "// ChanceCode %s ARM64 backend output\n", banner);
+	if (config && config->emit_build_version && config->build_version_directive && *config->build_version_directive)
+		fprintf(out, "%s\n\n", config->build_version_directive);
+	else
+		fputc('\n', out);
 
 	if (!arm64_collect_externs(&ctx))
 	{
@@ -3699,7 +3962,8 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	arm64_emit_externs(&ctx);
 	arm64_emit_globals(&ctx);
 	arm64_emit_debug_files(&ctx);
-	fprintf(out, ".section __TEXT,__text,regular,pure_instructions\n\n");
+	const char *text_section = (ctx.config && ctx.config->text_section) ? ctx.config->text_section : ".section __TEXT,__text,regular,pure_instructions";
+	fprintf(out, "%s\n\n", text_section);
 
 	for (size_t i = 0; i < module->function_count; ++i)
 	{
@@ -3756,14 +4020,24 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 	return true;
 }
 
-static const CCBackend kArm64Backend = {
+static const CCBackend kArm64BackendMac = {
 	.name = "arm64-macos",
 	.description = "Experimental macOS ARM64 backend",
 	.emit = arm64_emit_module,
-	.userdata = NULL,
+	.userdata = (void *)&kArm64ConfigMachO,
+};
+
+static const CCBackend kArm64BackendElf = {
+	.name = "arm64-elf",
+	.description = "Experimental Linux ELF ARM64 backend",
+	.emit = arm64_emit_module,
+	.userdata = (void *)&kArm64ConfigElf,
 };
 
 bool cc_register_backend_arm64(void)
 {
-	return cc_backend_register(&kArm64Backend);
+	bool ok = true;
+	ok = ok && cc_backend_register(&kArm64BackendMac);
+	ok = ok && cc_backend_register(&kArm64BackendElf);
+	return ok;
 }

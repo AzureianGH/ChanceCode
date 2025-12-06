@@ -99,6 +99,9 @@ static void cc_function_free(CCFunction *fn)
     free(fn->name);
     fn->name = NULL;
 
+    free(fn->section);
+    fn->section = NULL;
+
     free(fn->param_types);
     fn->param_types = NULL;
     fn->param_count = 0;
@@ -137,9 +140,13 @@ static void cc_global_free(CCGlobal *global)
         return;
     free(global->name);
     global->name = NULL;
+    free(global->section);
+    global->section = NULL;
     cc_global_init_reset(&global->init);
     global->type = CC_TYPE_INVALID;
     global->is_const = false;
+    global->is_extern = false;
+    global->is_hidden = false;
     global->alignment = 0;
 }
 
@@ -324,7 +331,10 @@ CCGlobal *cc_module_add_global(CCModule *module, const char *name)
     global->size = 0;
     global->alignment = 0;
     global->is_const = false;
+    global->is_extern = false;
+    global->is_hidden = false;
     global->init.kind = CC_GLOBAL_INIT_NONE;
+    global->section = NULL;
     return global;
 }
 
@@ -384,6 +394,7 @@ CCFunction *cc_module_add_function(CCModule *module, const char *name)
     fn->is_literal = false;
     fn->literal_lines = NULL;
     fn->literal_count = 0;
+    fn->section = NULL;
     return fn;
 }
 
@@ -1700,8 +1711,14 @@ static bool cc_write_global(FILE *out, const CCGlobal *global)
         return false;
     if (!cc_write_bool(out, global && global->is_const))
         return false;
+    if (!cc_write_bool(out, global && global->is_extern))
+        return false;
+    if (!cc_write_bool(out, global && global->is_hidden))
+        return false;
     size_t alignment = global ? global->alignment : 0;
     if (!cc_write_size32(out, alignment))
+        return false;
+    if (!cc_write_string(out, global ? global->section : NULL))
         return false;
 
     CCGlobalInitKind kind = global ? global->init.kind : CC_GLOBAL_INIT_NONE;
@@ -1948,6 +1965,8 @@ static bool cc_write_function(FILE *out, const CCFunction *fn)
         return false;
     if (!cc_write_bool(out, fn && fn->is_noreturn))
         return false;
+    if (!cc_write_string(out, fn ? fn->section : NULL))
+        return false;
 
     size_t param_count = fn ? fn->param_count : 0;
     if (!cc_write_size32(out, param_count))
@@ -1992,7 +2011,7 @@ bool cc_module_write_binary(const CCModule *module, const char *path, CCDiagnost
     static const char magic[] = {'C', 'C', 'B', 'I', 'N'};
     if (fwrite(magic, 1, sizeof(magic), out) != sizeof(magic))
         ok = false;
-    if (ok && !cc_write_u16(out, 1u))
+    if (ok && !cc_write_u16(out, 3u))
         ok = false;
     if (ok && !cc_write_u32(out, module->version))
         ok = false;

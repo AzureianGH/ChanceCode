@@ -526,27 +526,27 @@ int main(int argc, char **argv)
             opt_option.value = opt_level_buf;
             stack_options[stack_option_count++] = opt_option;
         }
-            if (strip_metadata && stack_option_count < sizeof(stack_options) / sizeof(stack_options[0]))
-            {
-                CCBackendOption strip_option;
-                strip_option.key = "strip";
-                strip_option.value = "1";
-                stack_options[stack_option_count++] = strip_option;
-            }
-            if (strip_hard && stack_option_count < sizeof(stack_options) / sizeof(stack_options[0]))
-            {
-                CCBackendOption strip_hard_option;
-                strip_hard_option.key = "strip-hard";
-                strip_hard_option.value = "1";
-                stack_options[stack_option_count++] = strip_hard_option;
-            }
-            if (obfuscate && stack_option_count < sizeof(stack_options) / sizeof(stack_options[0]))
-            {
-                CCBackendOption obfuscate_option;
-                obfuscate_option.key = "obfuscate";
-                obfuscate_option.value = "1";
-                stack_options[stack_option_count++] = obfuscate_option;
-            }
+        if (strip_metadata && stack_option_count < sizeof(stack_options) / sizeof(stack_options[0]))
+        {
+            CCBackendOption strip_option;
+            strip_option.key = "strip";
+            strip_option.value = "1";
+            stack_options[stack_option_count++] = strip_option;
+        }
+        if (strip_hard && stack_option_count < sizeof(stack_options) / sizeof(stack_options[0]))
+        {
+            CCBackendOption strip_hard_option;
+            strip_hard_option.key = "strip-hard";
+            strip_hard_option.value = "1";
+            stack_options[stack_option_count++] = strip_hard_option;
+        }
+        if (obfuscate && stack_option_count < sizeof(stack_options) / sizeof(stack_options[0]))
+        {
+            CCBackendOption obfuscate_option;
+            obfuscate_option.key = "obfuscate";
+            obfuscate_option.value = "1";
+            stack_options[stack_option_count++] = obfuscate_option;
+        }
 
         CCBackendOptions options;
         options.options = stack_options;
