@@ -136,8 +136,11 @@ extern "C"
         CCValueType type;
         size_t size;
         bool is_const;
+        bool is_extern;
+        bool is_hidden;
         size_t alignment;
         CCGlobalInit init;
+        char *section;
     } CCGlobal;
 
     typedef struct CCInstruction CCInstruction;
@@ -283,6 +286,7 @@ extern "C"
         bool is_preserve;
         char **literal_lines;
         size_t literal_count;
+        char *section;
     } CCFunction;
 
     typedef struct

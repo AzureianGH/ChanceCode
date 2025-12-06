@@ -648,12 +648,14 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
             cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated header in %s", display_path);
         return false;
     }
-    if (format_version != 1u)
+    if (format_version < 1u || format_version > 3u)
     {
         if (sink)
             cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: unsupported format version %u", (unsigned)format_version);
         return false;
     }
+    bool has_extern_globals = (format_version >= 2u);
+    bool has_global_visibility = (format_version >= 3u);
 
     uint32_t module_version = 0;
     if (!ccbin_read_u32(file, &module_version))
@@ -711,6 +713,30 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
         }
         global->is_const = is_const;
 
+        bool is_extern = false;
+        if (has_extern_globals)
+        {
+            if (!ccbin_read_bool(file, &is_extern))
+            {
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated global extern flag at index %zu", i);
+                goto fail;
+            }
+        }
+        global->is_extern = is_extern;
+
+        bool is_hidden = false;
+        if (has_global_visibility)
+        {
+            if (!ccbin_read_bool(file, &is_hidden))
+            {
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated global visibility flag at index %zu", i);
+                goto fail;
+            }
+        }
+        global->is_hidden = is_hidden;
+
         size_t alignment = 0;
         if (!ccbin_read_size32(file, &alignment))
         {
@@ -719,6 +745,16 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
             goto fail;
         }
         global->alignment = alignment;
+
+        char *section_name = NULL;
+        if (!ccbin_read_cstring(file, &section_name, true))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid global section at index %zu", i);
+            goto fail;
+        }
+        free(global->section);
+        global->section = section_name;
 
         uint8_t kind_u8 = 0;
         if (!ccbin_read_u8(file, &kind_u8) || kind_u8 > (uint8_t)CC_GLOBAL_INIT_BYTES)
@@ -925,6 +961,16 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
             goto fail;
         }
         fn->is_noreturn = flag;
+
+        char *section_name = NULL;
+        if (!ccbin_read_cstring(file, &section_name, true))
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid function section at index %zu", i);
+            goto fail;
+        }
+        free(fn->section);
+        fn->section = section_name;
 
         size_t param_count = 0;
         if (!ccbin_read_size32(file, &param_count))
@@ -1537,6 +1583,46 @@ static bool parse_string_literal(const char *input, char **out_data, size_t *out
     return true;
 }
 
+static bool parse_string_literal_to_cstring(LoaderState *st, const char *input, char **out_text, const char **out_end, const char *context)
+{
+    if (!out_text)
+        return false;
+    if (!input || input[0] != '"')
+    {
+        if (st && context)
+            loader_diag(st, CC_DIAG_ERROR, st->line, "%s requires a quoted string literal", context);
+        return false;
+    }
+
+    char *raw = NULL;
+    size_t raw_len = 0;
+    const char *tmp_end = NULL;
+    const char **end_ptr = out_end ? out_end : &tmp_end;
+    if (!parse_string_literal(input, &raw, &raw_len, end_ptr))
+    {
+        if (st && context)
+            loader_diag(st, CC_DIAG_ERROR, st->line, "malformed %s string literal", context);
+        free(raw);
+        return false;
+    }
+
+    char *copy = (char *)malloc(raw_len + 1);
+    if (!copy)
+    {
+        free(raw);
+        if (st)
+            loader_diag(st, CC_DIAG_ERROR, st->line, "out of memory while parsing %s", context ? context : "string literal");
+        return false;
+    }
+    if (raw_len > 0)
+        memcpy(copy, raw, raw_len);
+    copy[raw_len] = '\0';
+    free(raw);
+
+    *out_text = copy;
+    return true;
+}
+
 static CCGlobal *find_global(CCModule *module, const char *name)
 {
     if (!module || !name)
@@ -1801,7 +1887,10 @@ static bool parse_global(LoaderState *st, char *line)
     global->alignment = 0;
     global->type = CC_TYPE_INVALID;
     global->is_const = false;
+    global->is_extern = false;
+    global->is_hidden = false;
     reset_global_init(&global->init);
+    int saw_initializer = 0;
 
     while (*cursor)
     {
@@ -1829,6 +1918,7 @@ static bool parse_global(LoaderState *st, char *line)
                 global->init.payload.string.data = data;
                 global->init.payload.string.length = len;
                 cursor = (char *)end;
+                saw_initializer = 1;
                 continue;
             }
             else
@@ -1843,26 +1933,89 @@ static bool parse_global(LoaderState *st, char *line)
                 {
                     reset_global_init(&global->init);
                     global->init.kind = CC_GLOBAL_INIT_INT;
-                    global->init.payload.i64 = 0;
+                    global->init.payload.u64 = 0;
                 }
                 else
                 {
-                    uint64_t num = 0;
-                    if (!parse_uint64_token(value, &num))
+                    bool parsed_int = false;
+                    uint64_t int_value = 0;
+                    if (parse_uint64_token(value, &int_value))
                     {
-                        loader_diag(st, CC_DIAG_ERROR, st->line, "invalid initializer '%s'", value);
-                        *((char *)end) = saved;
-                        return false;
+                        parsed_int = true;
                     }
-                    reset_global_init(&global->init);
-                    global->init.kind = CC_GLOBAL_INIT_INT;
-                    global->init.payload.u64 = num;
+                    else
+                    {
+                        int64_t signed_value = 0;
+                        if (parse_int64_token(value, &signed_value))
+                        {
+                            parsed_int = true;
+                            int_value = (uint64_t)signed_value;
+                        }
+                    }
+
+                    if (parsed_int)
+                    {
+                        reset_global_init(&global->init);
+                        global->init.kind = CC_GLOBAL_INIT_INT;
+                        global->init.payload.u64 = int_value;
+                    }
+                    else
+                    {
+                        double float_value = 0.0;
+                        if (!parse_double_token(value, &float_value))
+                        {
+                            loader_diag(st, CC_DIAG_ERROR, st->line, "invalid initializer '%s'", value);
+                            *((char *)end) = saved;
+                            return false;
+                        }
+                        reset_global_init(&global->init);
+                        global->init.kind = CC_GLOBAL_INIT_FLOAT;
+                        global->init.payload.f64 = float_value;
+                    }
                 }
 
                 *((char *)end) = saved;
                 cursor = (char *)end;
+                saw_initializer = 1;
                 continue;
             }
+        }
+
+        if (strncmp(cursor, "data=", 5) == 0)
+        {
+            cursor += 5;
+            const char *value = cursor;
+            if (*value != '"')
+            {
+                loader_diag(st, CC_DIAG_ERROR, st->line, "data= attribute requires a string literal");
+                return false;
+            }
+            char *data = NULL;
+            size_t len = 0;
+            const char *end = NULL;
+            if (!parse_string_literal(value, &data, &len, &end))
+            {
+                loader_diag(st, CC_DIAG_ERROR, st->line, "malformed data initializer");
+                free(data);
+                return false;
+            }
+            if (global->size != 0 && global->size != len)
+            {
+                loader_diag(st, CC_DIAG_ERROR, st->line,
+                            "data initializer length (%zu) does not match declared size (%zu)",
+                            len, (size_t)global->size);
+                free(data);
+                return false;
+            }
+            reset_global_init(&global->init);
+            global->init.kind = CC_GLOBAL_INIT_BYTES;
+            global->init.payload.bytes.data = (uint8_t *)data;
+            global->init.payload.bytes.size = len;
+            if (global->size == 0)
+                global->size = len;
+            cursor = (char *)end;
+            saw_initializer = 1;
+            continue;
         }
 
         const char *end = cursor;
@@ -1904,9 +2057,28 @@ static bool parse_global(LoaderState *st, char *line)
             }
             global->alignment = align;
         }
+        else if (strncmp(cursor, "section=", 8) == 0)
+        {
+            char *section_name = NULL;
+            if (!parse_string_literal_to_cstring(st, cursor + 8, &section_name, NULL, "section attribute"))
+            {
+                *((char *)end) = saved;
+                return false;
+            }
+            free(global->section);
+            global->section = section_name;
+        }
         else if (strcmp(cursor, "const") == 0)
         {
             global->is_const = true;
+        }
+        else if (strcmp(cursor, "extern") == 0)
+        {
+            global->is_extern = true;
+        }
+        else if (strcmp(cursor, "hidden") == 0)
+        {
+            global->is_hidden = true;
         }
         else
         {
@@ -1915,6 +2087,12 @@ static bool parse_global(LoaderState *st, char *line)
 
         *((char *)end) = saved;
         cursor = (char *)end;
+    }
+
+    if (global->is_extern && saw_initializer)
+    {
+        loader_diag(st, CC_DIAG_ERROR, st->line, "extern global '%s' cannot have an initializer", global->name);
+        return false;
     }
 
     if (global->type == CC_TYPE_INVALID)
@@ -2862,7 +3040,7 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
                 success = false;
                 break;
             }
-            if (version != 2)
+            if (version < 2 || version > 3)
             {
                 loader_diag(&st, CC_DIAG_ERROR, st.line, "unsupported ccbytecode version %u", version);
                 success = false;
@@ -3128,6 +3306,17 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
                 {
                     current_fn->force_inline_literal = true;
                 }
+                else if (strncmp(token, "section=", 8) == 0)
+                {
+                    char *section_name = NULL;
+                    if (!parse_string_literal_to_cstring(&st, token + 8, &section_name, NULL, "section attribute"))
+                    {
+                        success = false;
+                        break;
+                    }
+                    free(current_fn->section);
+                    current_fn->section = section_name;
+                }
                 else
                 {
                     loader_diag(&st, CC_DIAG_WARNING, st.line, "unknown function attribute '%s'", token);
@@ -3140,9 +3329,9 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             // Validate that varargs functions have at least one explicit parameter
             if (current_fn->is_varargs && current_fn->param_count == 0)
             {
-                loader_diag(&st, CC_DIAG_ERROR, st.line, 
-                    "variadic function '%s' must have at least one explicit parameter before '...'", 
-                    current_fn->name);
+                loader_diag(&st, CC_DIAG_ERROR, st.line,
+                            "variadic function '%s' must have at least one explicit parameter before '...'",
+                            current_fn->name);
                 success = false;
                 break;
             }

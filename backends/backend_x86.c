@@ -201,10 +201,21 @@ typedef struct
     size_t hidden_fn_alias_capacity;
 } X86ModuleContext;
 
+typedef enum
+{
+    X86_PARAM_LOC_NONE = 0,
+    X86_PARAM_LOC_GP,
+    X86_PARAM_LOC_FP,
+    X86_PARAM_LOC_STACK
+} X86ParamLocation;
+
 typedef struct X86ParamInfo
 {
     bool needs_home;
     bool consumed;
+    X86ParamLocation location;
+    size_t reg_index;
+    size_t stack_index;
 } X86ParamInfo;
 
 typedef struct
@@ -871,50 +882,82 @@ static bool analyze_param_usage(X86FunctionContext *ctx)
 
     const CCValueType *param_types = ctx->fn->param_types;
     const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
+    size_t gp_used = 0;
+    size_t fp_used = 0;
+    size_t stack_used = 0;
 
     for (size_t i = 0; i < param_count; ++i)
     {
         CCValueType type = param_types ? param_types[i] : CC_TYPE_I64;
+        bool is_float = cc_value_type_is_float(type);
         bool needs_home = ctx->param_info[i].needs_home;
 
-        if (cc_value_type_is_float(type))
-            needs_home = true;
+        bool use_fp = (ctx->abi == &kX86AbiSystemV) && is_float && fp_used < abi->float_register_count;
+        bool use_gp = (!use_fp) && (gp_used < abi->int_register_count);
 
-        if (i >= abi->int_register_count)
-            needs_home = true;
+        X86ParamLocation location = X86_PARAM_LOC_STACK;
+        size_t reg_index = SIZE_MAX;
+        size_t stack_index = SIZE_MAX;
+
+        if (use_fp)
+        {
+            location = X86_PARAM_LOC_FP;
+            reg_index = fp_used++;
+        }
+        else if (use_gp)
+        {
+            location = X86_PARAM_LOC_GP;
+            reg_index = gp_used++;
+        }
+        else
+        {
+            location = X86_PARAM_LOC_STACK;
+            stack_index = stack_used++;
+        }
 
         bool register_available = false;
-        if (!cc_value_type_is_float(type) && i < abi->int_register_count)
+        if (location == X86_PARAM_LOC_GP)
         {
             switch (type)
             {
             case CC_TYPE_I1:
             case CC_TYPE_I8:
             case CC_TYPE_U8:
-                register_available = abi->reg8[i] != NULL;
+                register_available = reg_index < abi->int_register_count && abi->reg8[reg_index] != NULL;
                 break;
             case CC_TYPE_I16:
             case CC_TYPE_U16:
-                register_available = abi->reg16[i] != NULL;
+                register_available = reg_index < abi->int_register_count && abi->reg16[reg_index] != NULL;
                 break;
             case CC_TYPE_I32:
             case CC_TYPE_U32:
-                register_available = abi->reg32[i] != NULL;
+            case CC_TYPE_F32:
+                register_available = reg_index < abi->int_register_count && abi->reg32[reg_index] != NULL;
                 break;
             default:
-                register_available = abi->reg64[i] != NULL;
+                register_available = reg_index < abi->int_register_count && abi->reg64[reg_index] != NULL;
                 break;
             }
         }
+        else if (location == X86_PARAM_LOC_FP)
+        {
+            register_available = reg_index < abi->float_register_count && abi->xmm[reg_index] != NULL;
+        }
 
+        if (is_float)
+            needs_home = true;
+        if (location == X86_PARAM_LOC_STACK)
+            needs_home = true;
         if (!register_available)
             needs_home = true;
-
         if (load_counts[i] > 0)
             needs_home = true;
 
         ctx->param_info[i].needs_home = needs_home;
         ctx->param_info[i].consumed = false;
+        ctx->param_info[i].location = location;
+        ctx->param_info[i].reg_index = reg_index;
+        ctx->param_info[i].stack_index = stack_index;
         if (needs_home)
             ctx->home_param_stack_bytes += 8;
     }
@@ -1142,6 +1185,58 @@ static bool emit_store_from_rax_to_rbp(X86FunctionContext *ctx, size_t line, int
         break;
     }
     return true;
+}
+
+static const char *x86_param_register_name(const X86ABIInfo *abi, CCValueType type, size_t index)
+{
+    if (!abi)
+        return NULL;
+
+    switch (type)
+    {
+    case CC_TYPE_I1:
+    case CC_TYPE_I8:
+    case CC_TYPE_U8:
+        return (index < abi->int_register_count) ? abi->reg8[index] : NULL;
+    case CC_TYPE_I16:
+    case CC_TYPE_U16:
+        return (index < abi->int_register_count) ? abi->reg16[index] : NULL;
+    case CC_TYPE_I32:
+    case CC_TYPE_U32:
+    case CC_TYPE_F32:
+        return (index < abi->int_register_count) ? abi->reg32[index] : NULL;
+    default:
+        return (index < abi->int_register_count) ? abi->reg64[index] : NULL;
+    }
+}
+
+static void x86_copy_stack_arg_to_home(X86FunctionContext *ctx, CCValueType type, size_t stack_offset, int32_t home_offset)
+{
+    if (!ctx)
+        return;
+
+    switch (type)
+    {
+    case CC_TYPE_I1:
+    case CC_TYPE_I8:
+    case CC_TYPE_U8:
+        fprintf(ctx->out, "    mov al, %s [rbp + %zu]\n", ctx->syntax->byte_mem_keyword, stack_offset);
+        break;
+    case CC_TYPE_I16:
+    case CC_TYPE_U16:
+        fprintf(ctx->out, "    mov ax, %s [rbp + %zu]\n", ctx->syntax->word_mem_keyword, stack_offset);
+        break;
+    case CC_TYPE_I32:
+    case CC_TYPE_U32:
+    case CC_TYPE_F32:
+        fprintf(ctx->out, "    mov eax, %s [rbp + %zu]\n", ctx->syntax->dword_mem_keyword, stack_offset);
+        break;
+    default:
+        fprintf(ctx->out, "    mov rax, %s [rbp + %zu]\n", ctx->syntax->qword_mem_keyword, stack_offset);
+        break;
+    }
+
+    emit_store_from_rax_to_rbp(ctx, 0, home_offset, type);
 }
 
 static void emit_truncate_rax(FILE *out, CCValueType type, bool is_unsigned)
@@ -1533,29 +1628,11 @@ static bool emit_load_param(X86FunctionContext *ctx, const CCInstruction *ins)
     X86ParamInfo *info = (ctx->param_info && index < ctx->param_count) ? &ctx->param_info[index] : NULL;
     bool loaded_from_register = false;
 
-    if (info && !info->needs_home && !info->consumed && ctx->abi && index < ctx->abi->int_register_count && !cc_value_type_is_float(type))
+    const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
+
+    if (info && !info->needs_home && !info->consumed && info->location == X86_PARAM_LOC_GP && !cc_value_type_is_float(type))
     {
-        const X86ABIInfo *abi = ctx->abi;
-        const char *reg_name = NULL;
-        switch (type)
-        {
-        case CC_TYPE_I1:
-        case CC_TYPE_U8:
-        case CC_TYPE_I8:
-            reg_name = abi->reg8[index];
-            break;
-        case CC_TYPE_I16:
-        case CC_TYPE_U16:
-            reg_name = abi->reg16[index];
-            break;
-        case CC_TYPE_I32:
-        case CC_TYPE_U32:
-            reg_name = abi->reg32[index];
-            break;
-        default:
-            reg_name = abi->reg64[index];
-            break;
-        }
+        const char *reg_name = x86_param_register_name(abi, type, info->reg_index);
 
         if (reg_name)
         {
@@ -1720,6 +1797,57 @@ static bool emit_addr_global(X86FunctionContext *ctx, const CCInstruction *ins)
     x86_ensure_rax_available(ctx);
     fprintf(ctx->out, "    lea rax, %s\n", addr);
     return emit_push_rax(ctx->out, ctx, CC_TYPE_PTR, true);
+}
+
+static bool section_string_has_flags(const char *section_name)
+{
+    if (!section_name)
+        return false;
+    for (const char *p = section_name; *p; ++p)
+    {
+        if (*p == ',' || *p == '"' || *p == '@' || isspace((unsigned char)*p))
+            return true;
+    }
+    return false;
+}
+
+static void emit_global_data_section(X86ModuleContext *ctx, const CCGlobal *global)
+{
+    if (!ctx || !global || !ctx->syntax)
+        return;
+
+    if (global->section && global->section[0])
+    {
+        bool has_flags = section_string_has_flags(global->section);
+        if (ctx->syntax->flavor == X86_ASM_NASM)
+        {
+            if (has_flags)
+            {
+                fprintf(ctx->out, "section %s\n", global->section);
+            }
+            else
+            {
+                const char *writable = global->is_const ? "" : " write";
+                fprintf(ctx->out, "section %s progbits alloc%s\n", global->section, writable);
+            }
+        }
+        else
+        {
+            if (has_flags)
+            {
+                fprintf(ctx->out, ".section %s\n", global->section);
+            }
+            else
+            {
+                const char *flags = global->is_const ? "\"a\"" : "\"aw\"";
+                fprintf(ctx->out, ".section %s,%s,@progbits\n", global->section, flags);
+            }
+        }
+        return;
+    }
+
+    const char *section = global->is_const ? ctx->syntax->rodata_section : ctx->syntax->data_section;
+    fprintf(ctx->out, "%s\n", section);
 }
 
 static bool emit_load_indirect(X86FunctionContext *ctx, const CCInstruction *ins)
@@ -2628,48 +2756,74 @@ static void emit_function_prologue(X86FunctionContext *ctx)
         fprintf(ctx->out, "    sub rsp, %zu\n", ctx->frame_size);
 
     const X86ABIInfo *abi = ctx->abi ? ctx->abi : &kX86AbiWin64;
-    size_t reg_count = abi->int_register_count;
 
     for (size_t i = 0; i < ctx->param_count; ++i)
     {
-        if (!ctx->param_info || !ctx->param_info[i].needs_home)
+        X86ParamInfo *info = (ctx->param_info && i < ctx->param_count) ? &ctx->param_info[i] : NULL;
+        if (!info || !info->needs_home)
             continue;
         CCValueType type = ctx->fn->param_types ? ctx->fn->param_types[i] : CC_TYPE_I64;
         int32_t offset = ctx->param_offsets[i];
         if (offset == INT32_MIN)
             continue;
-        if (i < reg_count)
+        switch (info->location)
         {
+        case X86_PARAM_LOC_FP:
+            if (info->reg_index < abi->float_register_count)
+            {
+                const char *xmm = abi->xmm[info->reg_index];
+                if (xmm)
+                {
+                    if (type == CC_TYPE_F32)
+                        fprintf(ctx->out, "    movss %s [rbp%+d], %s\n", ctx->syntax->dword_mem_keyword, offset, xmm);
+                    else
+                        fprintf(ctx->out, "    movsd %s [rbp%+d], %s\n", ctx->syntax->qword_mem_keyword, offset, xmm);
+                    break;
+                }
+            }
+            /* fallback to stack copy if register is unavailable */
+            if (info->stack_index != SIZE_MAX)
+            {
+                size_t stack_offset = 16 + abi->shadow_space_bytes + info->stack_index * 8;
+                x86_copy_stack_arg_to_home(ctx, type, stack_offset, offset);
+            }
+            break;
+        case X86_PARAM_LOC_GP:
+        {
+            const char *reg_name = x86_param_register_name(abi, type, info->reg_index);
+            if (!reg_name)
+                break;
             switch (type)
             {
             case CC_TYPE_I1:
             case CC_TYPE_U8:
             case CC_TYPE_I8:
-                if (abi->reg8[i])
-                    fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->byte_mem_keyword, offset, abi->reg8[i]);
+                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->byte_mem_keyword, offset, reg_name);
                 break;
             case CC_TYPE_I16:
             case CC_TYPE_U16:
-                if (abi->reg16[i])
-                    fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->word_mem_keyword, offset, abi->reg16[i]);
+                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->word_mem_keyword, offset, reg_name);
                 break;
             case CC_TYPE_I32:
             case CC_TYPE_U32:
             case CC_TYPE_F32:
-                if (abi->reg32[i])
-                    fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->dword_mem_keyword, offset, abi->reg32[i]);
+                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->dword_mem_keyword, offset, reg_name);
                 break;
             default:
-                if (abi->reg64[i])
-                    fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->qword_mem_keyword, offset, abi->reg64[i]);
+                fprintf(ctx->out, "    mov %s [rbp%+d], %s\n", ctx->syntax->qword_mem_keyword, offset, reg_name);
                 break;
             }
+            break;
         }
-        else
-        {
-            size_t stack_offset = 16 + abi->shadow_space_bytes + (i - reg_count) * 8;
-            fprintf(ctx->out, "    mov rax, %s [rbp + %zu]\n", ctx->syntax->qword_mem_keyword, stack_offset);
-            emit_store_from_rax_to_rbp(ctx, 0, offset, type);
+        case X86_PARAM_LOC_STACK:
+            if (info->stack_index != SIZE_MAX)
+            {
+                size_t stack_offset = 16 + abi->shadow_space_bytes + info->stack_index * 8;
+                x86_copy_stack_arg_to_home(ctx, type, stack_offset, offset);
+            }
+            break;
+        default:
+            break;
         }
     }
 
@@ -2705,6 +2859,68 @@ static bool emit_literal_body(X86FunctionContext *ctx)
     fprintf(ctx->out, "    ret\n");
     ctx->saw_return = true;
     return true;
+}
+
+static void emit_packed_bytes(const X86ModuleContext *ctx, const CCGlobal *global)
+{
+    if (!ctx || !global)
+        return;
+
+    const uint8_t *bytes = global->init.payload.bytes.data;
+    size_t size = global->init.payload.bytes.size;
+    if (!bytes || size == 0)
+        return;
+
+    FILE *out = ctx->out;
+    const X86Syntax *syn = ctx->syntax;
+    size_t alignment = global->alignment ? global->alignment : cc_value_type_size(global->type);
+    if (alignment == 0)
+        alignment = 1;
+
+    size_t pos = 0;
+
+    if (alignment >= 8)
+    {
+        while (pos + 8 <= size)
+        {
+            unsigned long long value = 0;
+            for (int i = 0; i < 8; ++i)
+                value |= (unsigned long long)bytes[pos + i] << (i * 8);
+            fprintf(out, "    %s 0x%016llx\n", syn->qword_directive, value);
+            pos += 8;
+        }
+    }
+
+    if (alignment >= 4)
+    {
+        while (pos + 4 <= size)
+        {
+            unsigned long long value = 0;
+            for (int i = 0; i < 4; ++i)
+                value |= (unsigned long long)bytes[pos + i] << (i * 8);
+            fprintf(out, "    %s 0x%08llx\n", syn->dword_directive, value & 0xFFFFFFFFULL);
+            pos += 4;
+        }
+    }
+
+    if (alignment >= 2)
+    {
+        while (pos + 2 <= size)
+        {
+            unsigned long long value =
+                (unsigned long long)bytes[pos] | ((unsigned long long)bytes[pos + 1] << 8);
+            fprintf(out, "    %s 0x%04llx\n", syn->word_directive, value & 0xFFFFULL);
+            pos += 2;
+        }
+    }
+
+    if (pos < size)
+    {
+        fprintf(out, "    %s ", syn->byte_directive);
+        for (size_t i = pos; i < size; ++i)
+            fprintf(out, "%s0x%02x", (i == pos ? "" : ", "), bytes[i]);
+        fprintf(out, "\n");
+    }
 }
 
 static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
@@ -2807,9 +3023,12 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
 
 static void emit_global_data(const X86ModuleContext *ctx, const CCGlobal *global)
 {
+    if (!global || global->is_extern)
+        return;
     FILE *out = ctx->out;
-    const char *section = global->is_const ? ctx->syntax->rodata_section : ctx->syntax->data_section;
-    fprintf(out, "%s\n", section);
+    emit_global_data_section((X86ModuleContext *)ctx, global);
+    if (!global->is_hidden && global->name && global->name[0])
+        fprintf(out, "%s %s\n", ctx->syntax->global_directive, global->name);
     fprintf(out, "%s %zu\n", ctx->syntax->align_directive, global->alignment ? global->alignment : cc_value_type_size(global->type));
     fprintf(out, "%s:\n", global->name);
     size_t size = global->size ? global->size : cc_value_type_size(global->type);
@@ -2828,6 +3047,33 @@ static void emit_global_data(const X86ModuleContext *ctx, const CCGlobal *global
         else
             fprintf(out, "    %s 0x%016llx\n", ctx->syntax->qword_directive, (unsigned long long)global->init.payload.u64);
         break;
+    case CC_GLOBAL_INIT_FLOAT:
+    {
+        size_t elem_size = cc_value_type_size(global->type);
+        if (elem_size == 0)
+            elem_size = size >= 8 ? 8 : 4;
+        if (elem_size <= 4)
+        {
+            union
+            {
+                float f;
+                uint32_t bits;
+            } conv;
+            conv.f = (float)global->init.payload.f64;
+            fprintf(out, "    %s 0x%08x\n", ctx->syntax->dword_directive, conv.bits);
+        }
+        else
+        {
+            union
+            {
+                double f;
+                uint64_t bits;
+            } conv;
+            conv.f = global->init.payload.f64;
+            fprintf(out, "    %s 0x%016llx\n", ctx->syntax->qword_directive, (unsigned long long)conv.bits);
+        }
+        break;
+    }
     case CC_GLOBAL_INIT_STRING:
         fprintf(out, "    %s ", ctx->syntax->byte_directive);
         for (size_t i = 0; i < global->init.payload.string.length; ++i)
@@ -2835,10 +3081,7 @@ static void emit_global_data(const X86ModuleContext *ctx, const CCGlobal *global
         fprintf(out, ", 0\n");
         break;
     case CC_GLOBAL_INIT_BYTES:
-        fprintf(out, "    %s ", ctx->syntax->byte_directive);
-        for (size_t i = 0; i < global->init.payload.bytes.size; ++i)
-            fprintf(out, "%s0x%02x", (i == 0 ? "" : ", "), global->init.payload.bytes.data[i]);
-        fprintf(out, "\n");
+        emit_packed_bytes(ctx, global);
         break;
     default:
         fprintf(out, "    %s %zu\n", ctx->syntax->space_directive, size);
@@ -2875,6 +3118,15 @@ static bool collect_externs(X86ModuleContext *ctx)
     {
         const CCExtern *ext = &module->externs[i];
         if (ext->name && !string_set_add(&ctx->externs, ext->name))
+            return false;
+    }
+
+    for (size_t i = 0; i < module->global_count; ++i)
+    {
+        const CCGlobal *global = &module->globals[i];
+        if (!global || !global->is_extern || !global->name)
+            continue;
+        if (!string_set_add(&ctx->externs, global->name))
             return false;
     }
 
