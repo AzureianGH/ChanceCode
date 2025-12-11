@@ -31,7 +31,8 @@ static const char *const ARM64_SCRATCH_GP_REGS32[] = {"w9", "w10", "w11", "w12"}
 typedef enum
 {
 	ARM64_OBJECT_MACHO = 0,
-	ARM64_OBJECT_ELF = 1
+	ARM64_OBJECT_ELF = 1,
+	ARM64_OBJECT_COFF = 2
 } Arm64ObjectFormat;
 
 typedef struct
@@ -77,6 +78,22 @@ static const Arm64BackendConfig kArm64ConfigElf = {
 	.string_label_hint_format = ".L%s__%s",
 	.string_label_auto_format = ".Lstr%zu",
 	.target_os_option = "linux",
+	.prefix_symbols_with_underscore = false,
+	.local_label_prefix = ".L",
+	.emit_build_version = false,
+	.build_version_directive = NULL,
+};
+
+static const Arm64BackendConfig kArm64ConfigCoff = {
+	.format = ARM64_OBJECT_COFF,
+	.banner = "Windows/COFF",
+	.text_section = ".text",
+	.data_section = ".data",
+	.const_section = ".section .rdata,\"dr\"",
+	.cstring_section = ".section .rdata,\"dr\"",
+	.string_label_hint_format = ".L%s__%s",
+	.string_label_auto_format = ".Lstr%zu",
+	.target_os_option = "windows",
 	.prefix_symbols_with_underscore = false,
 	.local_label_prefix = ".L",
 	.emit_build_version = false,
@@ -3901,6 +3918,12 @@ static bool arm64_emit_module(const CCBackend *backend, const CCModule *module, 
 		}
 	}
 
+	if (config && config->format == ARM64_OBJECT_COFF && option_is_enabled(obfuscate_opt))
+	{
+		emit_diag(sink, CC_DIAG_ERROR, 0, "arm64 Windows backend does not yet support obfuscation");
+		return false;
+	}
+
 	FILE *out = stdout;
 	if (output_path)
 	{
@@ -4034,10 +4057,18 @@ static const CCBackend kArm64BackendElf = {
 	.userdata = (void *)&kArm64ConfigElf,
 };
 
+static const CCBackend kArm64BackendCoff = {
+	.name = "arm64-windows",
+	.description = "Experimental Windows ARM64 backend",
+	.emit = arm64_emit_module,
+	.userdata = (void *)&kArm64ConfigCoff,
+};
+
 bool cc_register_backend_arm64(void)
 {
 	bool ok = true;
 	ok = ok && cc_backend_register(&kArm64BackendMac);
 	ok = ok && cc_backend_register(&kArm64BackendElf);
+	ok = ok && cc_backend_register(&kArm64BackendCoff);
 	return ok;
 }
