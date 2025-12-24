@@ -641,6 +641,20 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
 {
     const char *display_path = path ? path : "<input>";
 
+    char magic[5] = {0};
+    if (!ccbin_read_exact(file, magic, sizeof(magic)))
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated header in %s", display_path);
+        return false;
+    }
+    if (memcmp(magic, "CCBIN", sizeof(magic)) != 0)
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid magic in %s", display_path);
+        return false;
+    }
+
     uint16_t format_version = 0;
     if (!ccbin_read_u16(file, &format_version))
     {
@@ -1496,10 +1510,13 @@ fail:
 
 static bool parse_string_literal(const char *input, char **out_data, size_t *out_len, const char **out_end)
 {
-    if (!input || !out_data || !out_len || input[0] != '"')
+    if (!input || !out_data || !out_len || input[0] != '"') {
+        fprintf(stderr, "parse_string_literal: input does not start with quote or is null. First bytes: '%.16s'\n", input ? input : "<null>");
         return false;
+    }
 
     const char *src = input + 1;
+    size_t col = 1;
     size_t capacity = 16;
     size_t length = 0;
     char *buffer = (char *)malloc(capacity);
@@ -1509,11 +1526,14 @@ static bool parse_string_literal(const char *input, char **out_data, size_t *out
     while (*src && *src != '"')
     {
         char ch = *src++;
+        ++col;
         if (ch == '\\')
         {
             char esc = *src++;
+            ++col;
             if (!esc)
             {
+                fprintf(stderr, "parse_string_literal: incomplete escape at column %zu: '%.16s'\n", col, src);
                 free(buffer);
                 return false;
             }
@@ -1541,9 +1561,11 @@ static bool parse_string_literal(const char *input, char **out_data, size_t *out
             {
                 if (!isxdigit((unsigned char)src[0]) || !isxdigit((unsigned char)src[1]))
                 {
+                    fprintf(stderr, "parse_string_literal: invalid hex escape at column %zu: '%.16s'\n", col, src);
                     free(buffer);
                     return false;
                 }
+                col += 2;
                 char hex[3] = {src[0], src[1], '\0'};
                 ch = (char)strtol(hex, NULL, 16);
                 src += 2;
@@ -1571,6 +1593,7 @@ static bool parse_string_literal(const char *input, char **out_data, size_t *out
 
     if (*src != '"')
     {
+        fprintf(stderr, "parse_string_literal: missing closing quote at column %zu. Remainder: '%.16s'\n", col, src);
         free(buffer);
         return false;
     }
@@ -2942,23 +2965,54 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
         return false;
     }
 
-    unsigned char magic[5];
-    size_t magic_read = fread(magic, 1, sizeof(magic), file);
-    if (magic_read == sizeof(magic) && memcmp(magic, "CCBIN", sizeof(magic)) == 0)
-    {
-        bool ok = cc_load_binary(file, path, module, sink);
-        fclose(file);
-        return ok;
-    }
-
-    if (fseek(file, 0, SEEK_SET) != 0)
+    // Read the entire file into memory
+    if (fseek(file, 0, SEEK_END) != 0)
     {
         if (sink)
-            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "failed to rewind %s", path);
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "failed to seek %s", path);
         fclose(file);
         return false;
     }
+    long file_size = ftell(file);
+    if (file_size < 0)
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "failed to ftell %s", path);
+        fclose(file);
+        return false;
+    }
+    rewind(file);
+    char *file_buf = (char *)malloc((size_t)file_size + 1);
+    if (!file_buf)
+    {
+        if (sink)
+            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "out of memory reading %s", path);
+        fclose(file);
+        return false;
+    }
+    size_t read_bytes = fread(file_buf, 1, (size_t)file_size, file);
+    file_buf[read_bytes] = '\0';
+    fclose(file);
 
+    // Check for CCBIN magic
+    if (read_bytes >= 5 && memcmp(file_buf, "CCBIN", 5) == 0)
+    {
+        // Reopen as binary for cc_load_binary
+        FILE *binfile = fopen(path, "rb");
+        if (!binfile)
+        {
+            if (sink)
+                cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "failed to reopen %s for binary load", path);
+            free(file_buf);
+            return false;
+        }
+        bool ok = cc_load_binary(binfile, path, module, sink);
+        fclose(binfile);
+        free(file_buf);
+        return ok;
+    }
+
+    // Parse as text from buffer
     bool success = true;
     LoaderState st = {0};
     st.path = path;
@@ -2969,19 +3023,32 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
 
     cc_module_init(module, 0);
 
-    char linebuf[2048];
+    // Split file_buf into lines (handle arbitrarily long lines)
+    char *buf_ptr = file_buf;
     bool header_read = false;
     CCFunction *current_fn = NULL;
     bool params_set = false;
     bool locals_set = false;
-
-    while (fgets(linebuf, sizeof(linebuf), file))
+    while (*buf_ptr)
     {
+        char *line_start = buf_ptr;
+        char *line_end = strchr(buf_ptr, '\n');
+        if (line_end)
+        {
+            *line_end = '\0';
+            buf_ptr = line_end + 1;
+        }
+        else
+        {
+            buf_ptr += strlen(buf_ptr);
+        }
         ++st.line;
-        strip_trailing_newline(linebuf);
-        char raw_line[sizeof(linebuf)];
-        memcpy(raw_line, linebuf, sizeof(raw_line));
-        char *line = trim(linebuf);
+        // Remove trailing carriage return if present
+        size_t linelen = strlen(line_start);
+        if (linelen > 0 && line_start[linelen - 1] == '\r')
+            line_start[linelen - 1] = '\0';
+        char *raw_line = strdup(line_start);
+        char *line = trim(line_start);
 
         if (st.reading_literal)
         {
@@ -2991,36 +3058,45 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
                 {
                     loader_diag(&st, CC_DIAG_ERROR, st.line, "empty literal block");
                     success = false;
+                    free(raw_line);
                     break;
                 }
                 st.literal_fn->is_literal = true;
                 st.literal_fn = NULL;
                 st.reading_literal = 0;
+                free(raw_line);
                 continue;
             }
             if (strncmp(line, ".endfunc", 8) == 0 && line[8] == '\0')
             {
                 loader_diag(&st, CC_DIAG_ERROR, st.line, "missing .endliteral before .endfunc");
                 success = false;
+                free(raw_line);
                 break;
             }
             if (!st.literal_fn)
             {
                 loader_diag(&st, CC_DIAG_ERROR, st.line, ".literal block without target function");
                 success = false;
+                free(raw_line);
                 break;
             }
             if (!cc_function_literal_append(st.literal_fn, raw_line))
             {
                 loader_diag(&st, CC_DIAG_ERROR, st.line, "failed to record literal line");
                 success = false;
+                free(raw_line);
                 break;
             }
+            free(raw_line);
             continue;
         }
 
         if (*line == '\0' || *line == '#')
+        {
+            free(raw_line);
             continue;
+        }
 
         if (!header_read)
         {
@@ -3028,6 +3104,7 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
             {
                 loader_diag(&st, CC_DIAG_ERROR, st.line, "missing ccbytecode header");
                 success = false;
+                free(raw_line);
                 break;
             }
             char *version_str = line + 10;

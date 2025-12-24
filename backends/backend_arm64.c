@@ -1266,17 +1266,22 @@ static size_t arm64_frame_offset(const Arm64FunctionContext *ctx, size_t offset)
 	return offset;
 }
 
+// Forward decl for immediate materialization helper used below.
+static void arm64_mov_imm(FILE *out, const char *reg, bool use_w, uint64_t value);
+
 static bool arm64_emit_stack_address(Arm64FunctionContext *ctx, size_t line, const char *dst_reg, size_t offset)
 {
 	if (!ctx || !ctx->out || !dst_reg)
 		return false;
 	size_t absolute = arm64_frame_offset(ctx, offset);
-	if (absolute > 4095)
+	if (absolute <= 4095)
 	{
-		emit_diag(ctx->sink, CC_DIAG_ERROR, line, "arm64 backend does not yet support stack offsets larger than 4095 bytes (got %zu)", absolute);
-		return false;
+		fprintf(ctx->out, "    add %s, %s, #%zu\n", dst_reg, ARM64_FRAME_REG, absolute);
+		return true;
 	}
-	fprintf(ctx->out, "    add %s, %s, #%zu\n", dst_reg, ARM64_FRAME_REG, absolute);
+	const char *tmp = ARM64_SCRATCH_GP_REGS64[0];
+	arm64_mov_imm(ctx->out, tmp, false, absolute);
+	fprintf(ctx->out, "    add %s, %s, %s\n", dst_reg, ARM64_FRAME_REG, tmp);
 	return true;
 }
 
@@ -1310,19 +1315,19 @@ static void arm64_mov_imm(FILE *out, const char *reg, bool use_w, uint64_t value
 	}
 }
 
-static bool arm64_adjust_sp(Arm64FunctionContext *ctx, size_t amount)
+static bool arm64_adjust_sp(Arm64FunctionContext *ctx, size_t amount, bool subtract)
 {
 	if (!ctx || amount == 0)
 		return true;
 	FILE *out = ctx->out;
 	if (amount <= 4095)
 	{
-		fprintf(out, "    sub sp, sp, #%zu\n", amount);
+		fprintf(out, "    %s sp, sp, #%zu\n", subtract ? "sub" : "add", amount);
 		return true;
 	}
 	const char *tmp_reg = ARM64_SCRATCH_GP_REGS64[0];
 	arm64_mov_imm(out, tmp_reg, false, amount);
-	fprintf(out, "    sub sp, sp, %s\n", tmp_reg);
+	fprintf(out, "    %s sp, sp, %s\n", subtract ? "sub" : "add", tmp_reg);
 	return true;
 }
 
@@ -2140,7 +2145,7 @@ static bool arm64_emit_stack_alloc(Arm64FunctionContext *ctx, const CCInstructio
 	if (alignment < ARM64_STACK_ALIGNMENT)
 		alignment = ARM64_STACK_ALIGNMENT;
 	size_t aligned_size = align_up_size(size_bytes, alignment);
-	if (!arm64_adjust_sp(ctx, aligned_size))
+	if (!arm64_adjust_sp(ctx, aligned_size, true))
 		return false;
 	const char *dst_reg = ARM64_SCRATCH_GP_REGS64[1];
 	fprintf(ctx->out, "    mov %s, sp\n", dst_reg);
@@ -3097,7 +3102,7 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 
 	total_stack_adjust = stack_arg_total + stack_spill_total;
 	if (total_stack_adjust > 0)
-		fprintf(ctx->out, "    sub sp, sp, #%zu\n", total_stack_adjust);
+		arm64_adjust_sp(ctx, total_stack_adjust, true);
 
 	if (stack_arg_total > 0)
 	{
@@ -3207,7 +3212,7 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	}
 
 	if (total_stack_adjust > 0)
-		fprintf(ctx->out, "    add sp, sp, #%zu\n", total_stack_adjust);
+		arm64_adjust_sp(ctx, total_stack_adjust, false);
 
 	ctx->stack_size -= arg_count;
 
@@ -3266,7 +3271,7 @@ static bool arm64_emit_ret(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	}
 	fprintf(ctx->out, "    mov sp, %s\n", ARM64_FRAME_REG);
 	if (ctx->frame_size > 0)
-		fprintf(ctx->out, "    add sp, sp, #%zu\n", ctx->frame_size);
+		arm64_adjust_sp(ctx, ctx->frame_size, false);
 	fprintf(ctx->out, "    ldp %s, x28, [sp], #16\n", ARM64_FRAME_REG);
 	fprintf(ctx->out, "    ldp x29, x30, [sp], #16\n");
 	fprintf(ctx->out, "    ret\n");
@@ -3462,7 +3467,7 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	fprintf(ctx->out, "    mov x29, sp\n");
 	fprintf(ctx->out, "    stp %s, x28, [sp, #-16]!\n", ARM64_FRAME_REG);
 	if (ctx->frame_size > 0)
-		fprintf(ctx->out, "    sub sp, sp, #%zu\n", ctx->frame_size);
+		arm64_adjust_sp(ctx, ctx->frame_size, true);
 	fprintf(ctx->out, "    mov %s, sp\n", ARM64_FRAME_REG);
 
 	size_t gp_param_index = 0;
@@ -3584,7 +3589,7 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 		}
 		fprintf(ctx->out, "    mov sp, %s\n", ARM64_FRAME_REG);
 		if (ctx->frame_size > 0)
-			fprintf(ctx->out, "    add sp, sp, #%zu\n", ctx->frame_size);
+			arm64_adjust_sp(ctx, ctx->frame_size, false);
 		fprintf(ctx->out, "    ldp %s, x28, [sp], #16\n", ARM64_FRAME_REG);
 		fprintf(ctx->out, "    ldp x29, x30, [sp], #16\n");
 		fprintf(ctx->out, "    ret\n");
