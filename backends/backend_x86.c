@@ -833,6 +833,18 @@ static void x86_flush_virtual_stack(X86FunctionContext *ctx)
     }
 }
 
+static void x86_discard_eval_stack(X86FunctionContext *ctx)
+{
+    if (!ctx)
+        return;
+    if (ctx->stack_depth <= 0)
+        return;
+    x86_flush_virtual_stack(ctx);
+    fprintf(ctx->out, "    add rsp, %d\n", ctx->stack_depth * 8);
+    ctx->stack_size = 0;
+    ctx->stack_depth = 0;
+}
+
 static bool analyze_param_usage(X86FunctionContext *ctx)
 {
     size_t param_count = ctx->fn->param_count;
@@ -2640,6 +2652,8 @@ static bool emit_ret(X86FunctionContext *ctx, const CCInstruction *ins)
     {
         fprintf(ctx->out, "    xor eax, eax\n");
     }
+    if (ctx->stack_depth > 0)
+        x86_discard_eval_stack(ctx);
     if (ctx->use_frame)
         fprintf(ctx->out, "    leave\n");
     fprintf(ctx->out, "    ret\n");
@@ -3007,6 +3021,8 @@ static bool emit_function(X86ModuleContext *module_ctx, const CCFunction *fn)
 
     if (!ctx.saw_return)
     {
+        if (ctx.stack_depth > 0)
+            x86_discard_eval_stack(&ctx);
         fprintf(ctx.out, "    xor eax, eax\n");
         if (ctx.use_frame)
             fprintf(ctx.out, "    leave\n");
