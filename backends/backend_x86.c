@@ -3083,6 +3083,19 @@ static void emit_global_data(const X86ModuleContext *ctx, const CCGlobal *global
     case CC_GLOBAL_INIT_BYTES:
         emit_packed_bytes(ctx, global);
         break;
+    case CC_GLOBAL_INIT_PTRS:
+    {
+        size_t count = global->init.payload.ptrs.count;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const char *entry = global->init.payload.ptrs.symbols[i];
+            if (!entry || entry[0] == '\0' || strcmp(entry, "null") == 0)
+                fprintf(out, "    %s 0\n", ctx->syntax->qword_directive);
+            else
+                fprintf(out, "    %s %s\n", ctx->syntax->qword_directive, entry);
+        }
+        break;
+    }
     default:
         fprintf(out, "    %s %zu\n", ctx->syntax->space_directive, size);
         break;

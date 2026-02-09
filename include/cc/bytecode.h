@@ -106,7 +106,8 @@ extern "C"
         CC_GLOBAL_INIT_INT,
         CC_GLOBAL_INIT_FLOAT,
         CC_GLOBAL_INIT_STRING,
-        CC_GLOBAL_INIT_BYTES
+        CC_GLOBAL_INIT_BYTES,
+        CC_GLOBAL_INIT_PTRS
     } CCGlobalInitKind;
 
     typedef struct
@@ -127,6 +128,11 @@ extern "C"
                 uint8_t *data;
                 size_t size;
             } bytes;
+            struct
+            {
+                char **symbols;
+                size_t count;
+            } ptrs;
         } payload;
     } CCGlobalInit;
 

@@ -3826,6 +3826,26 @@ static void arm64_emit_global_definition(const Arm64ModuleContext *ctx, const CC
 		initialized_bytes = len;
 		break;
 	}
+	case CC_GLOBAL_INIT_PTRS:
+	{
+		size_t count = global->init.payload.ptrs.count;
+		for (size_t i = 0; i < count; ++i)
+		{
+			const char *entry = global->init.payload.ptrs.symbols[i];
+			if (!entry || entry[0] == '\0' || strcmp(entry, "null") == 0)
+			{
+				fprintf(out, "    .quad 0\n");
+			}
+			else
+			{
+				char entry_buf[256];
+				const char *entry_sym = arm64_format_symbol(ctx, entry, entry_buf, sizeof(entry_buf));
+				fprintf(out, "    .quad %s\n", entry_sym ? entry_sym : entry);
+			}
+		}
+		initialized_bytes = count * 8;
+		break;
+	}
 	case CC_GLOBAL_INIT_NONE:
 	default:
 		initialized_bytes = 0;

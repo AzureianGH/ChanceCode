@@ -244,6 +244,17 @@ static void reset_global_init(CCGlobalInit *init)
         init->payload.bytes.data = NULL;
         init->payload.bytes.size = 0;
     }
+    else if (init->kind == CC_GLOBAL_INIT_PTRS)
+    {
+        if (init->payload.ptrs.symbols)
+        {
+            for (size_t i = 0; i < init->payload.ptrs.count; ++i)
+                free(init->payload.ptrs.symbols[i]);
+            free(init->payload.ptrs.symbols);
+        }
+        init->payload.ptrs.symbols = NULL;
+        init->payload.ptrs.count = 0;
+    }
     init->kind = CC_GLOBAL_INIT_NONE;
     memset(&init->payload, 0, sizeof(init->payload));
 }
@@ -662,7 +673,7 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
             cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated header in %s", display_path);
         return false;
     }
-    if (format_version < 1u || format_version > 3u)
+    if (format_version < 1u || format_version > 4u)
     {
         if (sink)
             cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: unsupported format version %u", (unsigned)format_version);
@@ -771,7 +782,7 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
         global->section = section_name;
 
         uint8_t kind_u8 = 0;
-        if (!ccbin_read_u8(file, &kind_u8) || kind_u8 > (uint8_t)CC_GLOBAL_INIT_BYTES)
+        if (!ccbin_read_u8(file, &kind_u8) || kind_u8 > (uint8_t)CC_GLOBAL_INIT_PTRS)
         {
             if (sink)
                 cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid global initializer kind at index %zu", i);
@@ -807,6 +818,44 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
             double value = 0.0;
             memcpy(&value, &bits, sizeof(value));
             global->init.payload.f64 = value;
+            break;
+        }
+        case CC_GLOBAL_INIT_PTRS:
+        {
+            size_t count = 0;
+            if (!ccbin_read_size32(file, &count))
+            {
+                if (sink)
+                    cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: truncated ptrs initializer for global index %zu", i);
+                goto fail;
+            }
+            char **symbols = NULL;
+            if (count > 0)
+            {
+                symbols = (char **)calloc(count, sizeof(char *));
+                if (!symbols)
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: out of memory reading ptrs initializer");
+                    goto fail;
+                }
+                for (size_t si = 0; si < count; ++si)
+                {
+                    char *sym = NULL;
+                    if (!ccbin_read_cstring(file, &sym, true))
+                    {
+                        if (sink)
+                            cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid ptrs symbol at global index %zu", i);
+                        for (size_t sj = 0; sj < si; ++sj)
+                            free(symbols[sj]);
+                        free(symbols);
+                        goto fail;
+                    }
+                    symbols[si] = sym;
+                }
+            }
+            global->init.payload.ptrs.symbols = symbols;
+            global->init.payload.ptrs.count = count;
             break;
         }
         case CC_GLOBAL_INIT_STRING:
@@ -2037,6 +2086,107 @@ static bool parse_global(LoaderState *st, char *line)
             if (global->size == 0)
                 global->size = len;
             cursor = (char *)end;
+            saw_initializer = 1;
+            continue;
+        }
+
+        if (strncmp(cursor, "ptrs=", 5) == 0)
+        {
+            cursor += 5;
+            char *value = cursor;
+            while (*cursor && !isspace((unsigned char)*cursor))
+                ++cursor;
+            char saved = *cursor;
+            *cursor = '\0';
+
+            char *list = value;
+            if (*list == '[')
+            {
+                ++list;
+                size_t len = strlen(list);
+                if (len > 0 && list[len - 1] == ']')
+                    list[len - 1] = '\0';
+            }
+
+            size_t count = 0;
+            char **symbols = NULL;
+            bool ok = true;
+            char *token = list;
+            while (ok)
+            {
+                char *comma = strchr(token, ',');
+                if (comma)
+                    *comma = '\0';
+                if (*token == '\0' || strcmp(token, "null") == 0)
+                {
+                    char **grown = (char **)realloc(symbols, (count + 1) * sizeof(char *));
+                    if (!grown)
+                    {
+                        ok = false;
+                        break;
+                    }
+                    symbols = grown;
+                    symbols[count++] = NULL;
+                }
+                else
+                {
+                    char *copy = duplicate_token(token);
+                    if (!copy)
+                    {
+                        ok = false;
+                        break;
+                    }
+                    char **grown = (char **)realloc(symbols, (count + 1) * sizeof(char *));
+                    if (!grown)
+                    {
+                        free(copy);
+                        ok = false;
+                        break;
+                    }
+                    symbols = grown;
+                    symbols[count++] = copy;
+                }
+
+                if (!comma)
+                    break;
+                token = comma + 1;
+            }
+
+            if (!ok)
+            {
+                if (symbols)
+                {
+                    for (size_t i = 0; i < count; ++i)
+                        free(symbols[i]);
+                    free(symbols);
+                }
+                loader_diag(st, CC_DIAG_ERROR, st->line, "failed to parse ptrs= initializer");
+                *cursor = saved;
+                return false;
+            }
+
+            if (global->size != 0 && global->size != count * 8)
+            {
+                for (size_t i = 0; i < count; ++i)
+                    free(symbols[i]);
+                free(symbols);
+                loader_diag(st, CC_DIAG_ERROR, st->line,
+                            "ptrs initializer length (%zu pointers) does not match declared size (%zu)",
+                            count, (size_t)global->size);
+                *cursor = saved;
+                return false;
+            }
+
+            reset_global_init(&global->init);
+            global->init.kind = CC_GLOBAL_INIT_PTRS;
+            global->init.payload.ptrs.symbols = symbols;
+            global->init.payload.ptrs.count = count;
+            if (global->size == 0)
+                global->size = count * 8;
+            if (global->alignment == 0)
+                global->alignment = 8;
+
+            *cursor = saved;
             saw_initializer = 1;
             continue;
         }

@@ -35,6 +35,16 @@ static void cc_global_init_reset(CCGlobalInit *init)
         init->payload.bytes.data = NULL;
         init->payload.bytes.size = 0;
         break;
+    case CC_GLOBAL_INIT_PTRS:
+        if (init->payload.ptrs.symbols)
+        {
+            for (size_t i = 0; i < init->payload.ptrs.count; ++i)
+                free(init->payload.ptrs.symbols[i]);
+            free(init->payload.ptrs.symbols);
+        }
+        init->payload.ptrs.symbols = NULL;
+        init->payload.ptrs.count = 0;
+        break;
     default:
         break;
     }
@@ -1754,6 +1764,18 @@ static bool cc_write_global(FILE *out, const CCGlobal *global)
             return false;
         return cc_write_bytes(out, global->init.payload.bytes.data, len);
     }
+    case CC_GLOBAL_INIT_PTRS:
+    {
+        size_t count = global->init.payload.ptrs.count;
+        if (!cc_write_size32(out, count))
+            return false;
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (!cc_write_string(out, global->init.payload.ptrs.symbols[i]))
+                return false;
+        }
+        return true;
+    }
     default:
         return false;
     }
@@ -2011,7 +2033,7 @@ bool cc_module_write_binary(const CCModule *module, const char *path, CCDiagnost
     static const char magic[] = {'C', 'C', 'B', 'I', 'N'};
     if (fwrite(magic, 1, sizeof(magic), out) != sizeof(magic))
         ok = false;
-    if (ok && !cc_write_u16(out, 3u))
+    if (ok && !cc_write_u16(out, 4u))
         ok = false;
     if (ok && !cc_write_u32(out, module->version))
         ok = false;
