@@ -3197,11 +3197,18 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
         size_t linelen = strlen(line_start);
         if (linelen > 0 && line_start[linelen - 1] == '\r')
             line_start[linelen - 1] = '\0';
-        char *raw_line = strdup(line_start);
+        char *raw_line = NULL;
         char *line = trim(line_start);
 
         if (st.reading_literal)
         {
+            raw_line = strdup(line_start);
+            if (!raw_line)
+            {
+                loader_diag(&st, CC_DIAG_ERROR, st.line, "out of memory reading literal");
+                success = false;
+                break;
+            }
             if (strncmp(line, ".endliteral", 11) == 0 && line[11] == '\0')
             {
                 if (!st.literal_fn || st.literal_fn->literal_count == 0)
@@ -3692,7 +3699,7 @@ bool cc_load_file(const char *path, CCModule *module, CCDiagnosticSink *sink)
     if (success && !resolve_pending_addr_globals(&st))
         success = false;
 
-    fclose(file);
+    free(file_buf);
 
     pending_noreturn_destroy(&st);
     pending_addr_globals_destroy(&st);
