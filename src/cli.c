@@ -283,6 +283,13 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i)
     {
         const char *arg = argv[i];
+        if (strcmp(arg, "--version") == 0)
+        {
+            printf("ccb: ChanceCode bytecode compiler\n");
+            printf("ccb: License: OpenAzure License\n");
+            printf("ccb: Compiled on %s %s\n", __DATE__, __TIME__);
+            return 0;
+        }
         if (strcmp(arg, "--backend") == 0)
         {
             if (i + 1 >= argc)

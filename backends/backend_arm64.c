@@ -25,6 +25,8 @@ static const char *const ARM64_FP_REGS32[] = {"s0", "s1", "s2", "s3", "s4", "s5"
 static const char *const ARM64_SCRATCH_GP_REGS64[] = {"x9", "x10", "x11", "x12"};
 static const char *const ARM64_SCRATCH_GP_REGS32[] = {"w9", "w10", "w11", "w12"};
 
+#define ARM64_VARARG_PTR_REG "x15"
+
 #define ARM64_FRAME_REG "x27"
 #define ARM64_FRAME_REG32 "w27"
 
@@ -2085,9 +2087,10 @@ static bool arm64_emit_addr_param(Arm64FunctionContext *ctx, const CCInstruction
 			emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "vararg base requested in non-varargs function");
 			return false;
 		}
-		size_t offset = ctx->vararg_area_offset + ctx->vararg_gp_start * 8;
-		if (!arm64_emit_stack_address(ctx, ins->line, dst_reg, offset))
+		const char *addr_reg = ARM64_SCRATCH_GP_REGS64[1];
+		if (!arm64_emit_stack_address(ctx, ins->line, addr_reg, ctx->vararg_area_offset))
 			return false;
+		fprintf(ctx->out, "    ldr %s, [%s]\n", dst_reg, addr_reg);
 	}
 	else
 	{
@@ -2889,7 +2892,9 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	size_t stack_arg_total = 0;
 	Arm64ArgLocation *locations = NULL;
 	bool success = false;
-	size_t stack_spill_total = 0;
+	size_t vararg_pack_size = 0;
+	size_t vararg_pack_base = 0;
+	size_t vararg_count = 0;
 	size_t total_stack_adjust = 0;
 	size_t arg_base = ctx->stack_size - arg_count;
 	for (size_t i = 0; i < arg_base; ++i)
@@ -2959,29 +2964,6 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 					loc->fp_is_s = use_s;
 					loc->type = arg_type;
 					loc->type_is_signed = false;
-				}
-				if (is_vararg_arg)
-				{
-					if (gp_used >= sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]))
-					{
-						emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend cannot mirror vararg float into GP register (ran out of x regs)");
-						goto cleanup;
-					}
-					const size_t gp_index = gp_used++;
-					const char *gp_reg64 = ARM64_GP_REGS64[gp_index];
-					const char *gp_reg32 = ARM64_GP_REGS32[gp_index];
-					if (use_s)
-						fprintf(ctx->out, "    fmov %s, %s\n", gp_reg32, target_reg);
-					else
-						fprintf(ctx->out, "    fmov %s, %s\n", gp_reg64, target_reg);
-					if (loc)
-					{
-						loc->uses_gp_reg = true;
-						loc->gp_is_w = false;
-						loc->gp_reg_index = gp_index;
-						loc->type = arg_type;
-						loc->type_is_signed = false;
-					}
 				}
 				fp_used++;
 			}
@@ -3066,41 +3048,13 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		if (fixed_params > arg_count)
 			fixed_params = arg_count;
 
-		size_t spill_cursor = 0;
-		for (size_t i = fixed_params; i < arg_count; ++i)
-		{
-			Arm64ArgLocation *loc = &locations[i];
-			if (!loc)
-				continue;
-			if (loc->uses_stack)
-				continue;
-			if (!loc->uses_gp_reg && !loc->uses_fp_reg)
-			{
-				emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend cannot mirror vararg argument with unknown location");
-				goto cleanup;
-			}
-
-			CCValueType arg_type = ins->data.call.arg_types ? ins->data.call.arg_types[i] : CC_TYPE_I64;
-			size_t value_size = cc_value_type_size(arg_type);
-			if (value_size == 0)
-				value_size = 8;
-			if (value_size > 8)
-			{
-				emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "arm64 backend does not yet support vararg aggregates larger than 8 bytes");
-				goto cleanup;
-			}
-			if (value_size < 8)
-				value_size = 8;
-
-			loc->spill_offset = align_up_size(spill_cursor, 8);
-			loc->spill_size = value_size;
-			spill_cursor = loc->spill_offset + loc->spill_size;
-		}
-
-		stack_spill_total = align_up_size(spill_cursor, ARM64_STACK_ALIGNMENT);
+		vararg_count = (arg_count > fixed_params) ? (arg_count - fixed_params) : 0;
+		if (vararg_count > 0)
+			vararg_pack_size = align_up_size(vararg_count * 8, ARM64_STACK_ALIGNMENT);
+		vararg_pack_base = stack_arg_total;
 	}
 
-	total_stack_adjust = stack_arg_total + stack_spill_total;
+	total_stack_adjust = stack_arg_total + vararg_pack_size;
 	if (total_stack_adjust > 0)
 		arm64_adjust_sp(ctx, total_stack_adjust, true);
 
@@ -3142,29 +3096,57 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		}
 	}
 
-	if (call_declares_varargs && stack_spill_total > 0)
+	if (call_declares_varargs)
 	{
-		size_t spill_base = stack_arg_total;
 		for (size_t i = fixed_params; i < arg_count; ++i)
 		{
-			Arm64ArgLocation *loc = &locations[i];
-			if (!loc || loc->uses_stack)
-				continue;
-			size_t addr = spill_base + loc->spill_offset;
-			if (loc->uses_gp_reg)
+			Arm64Value *value = &ctx->stack[arg_base + i];
+			CCValueType arg_type = ins->data.call.arg_types ? ins->data.call.arg_types[i] : CC_TYPE_I64;
+			size_t addr = vararg_pack_base + (i - fixed_params) * 8;
+			if (cc_value_type_is_float(arg_type))
 			{
-				const char *xreg = ARM64_GP_REGS64[loc->gp_reg_index];
-				const char *wreg = ARM64_GP_REGS32[loc->gp_reg_index];
-				if (loc->gp_is_w && loc->type_is_signed)
-					fprintf(ctx->out, "    sxtw %s, %s\n", xreg, wreg);
+				const char *fp_reg = (arg_type == CC_TYPE_F32) ? "s15" : "d15";
+				if (!arm64_materialize_fp(ctx, value, fp_reg, arg_type))
+					goto cleanup;
+				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", fp_reg, addr);
+			}
+			else
+			{
+				size_t size_bytes = arm64_type_size(arg_type);
+				if (size_bytes == 0)
+					size_bytes = 8;
+				const char *xreg = ARM64_SCRATCH_GP_REGS64[0];
+				const char *wreg = ARM64_SCRATCH_GP_REGS32[0];
+				bool use_w = (size_bytes <= 4);
+				if (!arm64_materialize_gp(ctx, value, use_w ? wreg : xreg, use_w))
+					goto cleanup;
+				if (size_bytes < 8)
+				{
+					bool sign_extend = cc_value_type_is_signed(arg_type);
+					if (size_bytes == 1)
+						fprintf(ctx->out, "    %s %s, %s\n", sign_extend ? "sxtb" : "uxtb", xreg, wreg);
+					else if (size_bytes == 2)
+						fprintf(ctx->out, "    %s %s, %s\n", sign_extend ? "sxth" : "uxth", xreg, wreg);
+					else
+						fprintf(ctx->out, "    %s %s, %s\n", sign_extend ? "sxtw" : "uxtw", xreg, wreg);
+				}
 				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", xreg, addr);
 			}
-			else if (loc->uses_fp_reg)
-			{
-				const char *dreg = ARM64_FP_REGS[loc->fp_reg_index];
-				const char *sreg = ARM64_FP_REGS32[loc->fp_reg_index];
-				fprintf(ctx->out, "    str %s, [sp, #%zu]\n", loc->fp_is_s ? sreg : dreg, addr);
-			}
+		}
+
+		if (vararg_pack_base == 0)
+		{
+			fprintf(ctx->out, "    mov %s, sp\n", ARM64_VARARG_PTR_REG);
+		}
+		else if (vararg_pack_base <= 4095)
+		{
+			fprintf(ctx->out, "    add %s, sp, #%zu\n", ARM64_VARARG_PTR_REG, vararg_pack_base);
+		}
+		else
+		{
+			const char *tmp = ARM64_SCRATCH_GP_REGS64[0];
+			arm64_mov_imm(ctx->out, tmp, false, vararg_pack_base);
+			fprintf(ctx->out, "    add %s, sp, %s\n", ARM64_VARARG_PTR_REG, tmp);
 		}
 	}
 
@@ -3440,9 +3422,7 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 	{
 		ctx->has_vararg_area = true;
 		ctx->vararg_area_offset = slot_index * 8;
-		// Reserve space for 8 GPRs (x0-x7) AND 8 FPRs (d0-d7)
-		slot_index += 8; // x0-x7
-		slot_index += 8; // d0-d7
+		slot_index += 1;
 	}
 
 	param_local_bytes = slot_index * 8;
@@ -3552,26 +3532,10 @@ static bool arm64_emit_function(Arm64FunctionContext *ctx)
 
 	if (ctx->has_vararg_area)
 	{
-		ctx->vararg_gp_start = gp_param_index;
-		size_t base_offset = ctx->vararg_area_offset;
-		size_t gp_reg_count = sizeof(ARM64_GP_REGS64) / sizeof(ARM64_GP_REGS64[0]);
-
-		// Spill General Purpose Registers (x0-x7)
-		for (size_t reg = 0; reg < gp_reg_count; ++reg)
-		{
-			size_t addr = arm64_frame_offset(ctx, base_offset + reg * 8);
-			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_GP_REGS64[reg], ARM64_FRAME_REG, addr);
-		}
-
-		// Spill Floating Point Registers (d0-d7)
-		// These follow immediately after the 8 GPRs (8 * 8 = 64 bytes offset)
-		size_t fp_base_offset = base_offset + (gp_reg_count * 8);
-		size_t fp_reg_count = sizeof(ARM64_FP_REGS) / sizeof(ARM64_FP_REGS[0]);
-		for (size_t reg = 0; reg < fp_reg_count; ++reg)
-		{
-			size_t addr = arm64_frame_offset(ctx, fp_base_offset + reg * 8);
-			fprintf(ctx->out, "    str %s, [%s, #%zu]\n", ARM64_FP_REGS[reg], ARM64_FRAME_REG, addr);
-		}
+		const char *addr_reg = ARM64_SCRATCH_GP_REGS64[0];
+		if (!arm64_emit_stack_address(ctx, 0, addr_reg, ctx->vararg_area_offset))
+			goto fail;
+		fprintf(ctx->out, "    str %s, [%s]\n", ARM64_VARARG_PTR_REG, addr_reg);
 	}
 
 	for (size_t i = 0; i < ctx->fn->instruction_count; ++i)
