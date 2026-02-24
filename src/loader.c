@@ -3013,27 +3013,57 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
         }
         while (*args_list && isspace((unsigned char)*args_list))
             ++args_list;
+        bool is_varargs = false;
+        size_t args_len = strlen(args_list);
+        char *args_copy = (char *)malloc(args_len + 1);
+        if (!args_copy)
+            return false;
+        memcpy(args_copy, args_list, args_len + 1);
+        char *end = args_copy + args_len;
+        while (end > args_copy && isspace((unsigned char)end[-1]))
+            --end;
+        *end = '\0';
+        const char *varargs_kw = "varargs";
+        size_t varargs_len = strlen(varargs_kw);
+        if ((size_t)(end - args_copy) >= varargs_len)
+        {
+            char *tail = end - varargs_len;
+            if (strcmp(tail, varargs_kw) == 0)
+            {
+                char *scan = tail;
+                while (scan > args_copy && isspace((unsigned char)scan[-1]))
+                    --scan;
+                *scan = '\0';
+                is_varargs = true;
+            }
+        }
         CCValueType ret_ty = parse_type_token(ret_type);
         if (ret_ty == CC_TYPE_INVALID)
         {
             loader_diag(st, CC_DIAG_ERROR, st->line, "invalid return type '%s'", ret_type);
+            free(args_copy);
             return false;
         }
         CCValueType *arg_types = NULL;
         size_t arg_count = 0;
-        if (!parse_type_list(st, args_list, &arg_types, &arg_count))
+        if (!parse_type_list(st, args_copy, &arg_types, &arg_count))
+        {
+            free(args_copy);
             return false;
+        }
         ins = append_instruction(st, fn, CC_INSTR_CALL);
         if (!ins)
         {
             free(arg_types);
+            free(args_copy);
             return false;
         }
         ins->data.call.symbol = duplicate_token(symbol);
         ins->data.call.return_type = ret_ty;
         ins->data.call.arg_types = arg_types;
         ins->data.call.arg_count = arg_count;
-        ins->data.call.is_varargs = false;
+        ins->data.call.is_varargs = is_varargs;
+        free(args_copy);
         return true;
     }
 

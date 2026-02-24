@@ -521,6 +521,13 @@ static bool arm64_lookup_signature(const Arm64ModuleContext *ctx, const char *sy
 	return false;
 }
 
+static bool arm64_symbol_uses_cc_varargs(const char *symbol)
+{
+	if (!symbol || !*symbol)
+		return true;
+	return strchr(symbol, '_') != NULL;
+}
+
 static size_t arm64_type_size(CCValueType type)
 {
 	switch (type)
@@ -2911,8 +2918,9 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		have_prototype = arm64_lookup_signature(ctx->module, ins->data.call.symbol, &fixed_params, &callee_is_varargs);
 
 	bool call_declares_varargs = ins->data.call.is_varargs;
-	if (!call_declares_varargs && have_prototype && callee_is_varargs && arg_count > fixed_params)
+	if (!call_declares_varargs && have_prototype && callee_is_varargs)
 		call_declares_varargs = true;
+	bool use_vararg_pack = call_declares_varargs && arm64_symbol_uses_cc_varargs(ins->data.call.symbol);
 
 	if (have_prototype && !callee_is_varargs && arg_count > fixed_params)
 	{
@@ -3031,7 +3039,7 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 
 	stack_arg_total = align_up_size(stack_arg_cursor, ARM64_STACK_ALIGNMENT);
 
-	if (call_declares_varargs)
+	if (use_vararg_pack)
 	{
 		if (!ins->data.call.symbol && !ins->data.call.is_varargs)
 		{
@@ -3096,7 +3104,7 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 		}
 	}
 
-	if (call_declares_varargs)
+	if (use_vararg_pack)
 	{
 		for (size_t i = fixed_params; i < arg_count; ++i)
 		{
