@@ -1,203 +1,54 @@
-# ChanceCode Specifications (CC1, CC2, CC3)
+# ChanceCode
 
-This document describes the ChanceCode bytecode formats as implemented by the ChanceCode loader and the CHance front-end.
-It is derived from the current ChanceCode sources and the CHance `chancec` code generator.
+ChanceCode is the backend toolkit for the CHance toolchain. It loads textual Chance bytecode (`.ccb`), applies optimizations over an in-memory IR (`CCModule`), and emits assembly, objects, or binary modules (`.ccbin`) through pluggable backends.
 
-## 1. Artifacts
-- **Textual bytecode:** `.ccb` (ChanceCode source)
-- **Binary module:** `.ccbin` (serialized `CCModule`)
+The command-line driver is `chancecodec` (often referred to as the ChanceCode compiler). It shares the same backend registry used by library consumers.
 
-## 2. Common Concepts
-### 2.1 Value Types
-Text tokens map to `CCValueType`:
-- `i1`, `i8`, `u8`, `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f32`, `f64`, `ptr`, `void`
+## Highlights
+- Loader with structural validation, constant folding, and diagnostics.
+- In-memory IR for globals, externs, functions, and instructions.
+- Binary serializer for `.ccbin` modules.
+- Pluggable backends with a reference x86-64 and ARM64 implementation.
 
-Sizes (bytes): `i1/i8/u8=1`, `i16/u16=2`, `i32/u32/f32=4`, `i64/u64/f64/ptr=8`, `void=0`.
+## Repository Layout
+- `include/cc/` public headers (`backend.h`, `bytecode.h`, `diagnostics.h`, `loader.h`).
+- `src/` core loader, IR utilities, and CLI.
+- `backends/` built-in backend implementations.
+- `tests/` `.ccb` samples and regression cases.
 
-### 2.2 Module Sections
-A module contains:
-- Globals
-- Externs
-- Functions
-- Optional debug file table (textual form only)
-
-### 2.3 Stack Semantics (Execution Model)
-Instructions operate on an implicit evaluation stack:
-- `const*`, `load_*`, `addr_*`, `binop`, `unop`, `compare`, `convert`, `stack_alloc` push values.
-- `store_*`, `store_indirect`, `drop`, `ret` consume values.
-- Branch/jump instructions use labels.
-
-## 3. Textual Format (.ccb)
-### 3.1 Header
-The first non-empty, non-comment line must be:
+## Building
 ```
-ccbytecode <version>
+cmake --preset mingw-release
+cmake --build --preset mingw-release
+
+ctest --preset mingw-release
 ```
-Supported versions in the current loader: `2` and `3`.
 
-### 3.2 Comments and Whitespace
-- Blank lines are ignored.
-- Lines starting with `#` are ignored.
-- Tokens are separated by spaces or tabs.
+The helper scripts `build.sh` and `build.bat` mirror the preset workflow.
 
-### 3.3 Directives
-#### 3.3.1 `.file` (debug file table)
+## chancecodec CLI
 ```
-.file <id> "path"
+chancecodec input.ccb \
+  --backend arm64-macos \
+  --output output.s \
+  --option target-os=macos \
+  --emit-ccbin output.ccbin
 ```
-- `id` is a positive integer.
-- `path` is a quoted string literal.
 
-#### 3.3.2 `.loc` (debug location)
-```
-.loc <file-id> <line> <column>
-```
-Sets the debug location for subsequent instructions.
+Key flags:
+- `--backend <name>` selects a backend (default: first registered backend).
+- `--list-backends` lists available backends.
+- `--output <path>` writes backend output to a file.
+- `--emit-ccbin <path>` writes a `.ccbin` module.
+- `--option key=value` passes backend-specific options.
+- `-O0|-O1|-O2|-O3` enables IR optimization passes.
 
-#### 3.3.3 `.global`
-```
-.global <name> <attrs...>
-```
-Attributes (order independent):
-- `type=<type>` (required)
-- `size=<bytes>`
-- `align=<bytes>`
-- `section="..."`
-- `const`
-- `extern`
-- `hidden`
-- `init=<literal|"string"|null>`
-- `data="..."` (raw bytes)
-- `ptrs=[sym1,sym2,null,...]`
+## Specs
+See the full bytecode specification in [SPEC.md](SPEC.md).
 
-Rules:
-- Extern globals cannot specify an initializer.
-- If `size` is omitted, it defaults to the type size.
-- If `align` is omitted, it defaults to the type size.
-- `data=` sets a byte array initializer; if `size` is provided, it must match the data length.
-- `ptrs=` sets a pointer table; `size` must match `count * 8` if provided; alignment defaults to 8.
-
-#### 3.3.4 `.extern`
-```
-.extern <name> <attrs...>
-```
-Attributes:
-- `params=(type,type,...)` or `params=<count>`
-- `returns=<type>`
-- `varargs`
-- `no-return` or `noreturn`
-
-#### 3.3.5 `.no-return`
-```
-.no-return <symbol>
-```
-Marks an extern or function as no-return, even if declared later.
-
-#### 3.3.6 `.preserve`
-```
-.preserve <function>
-```
-Marks a function as preserved (do not drop during optimisation).
-
-#### 3.3.7 `.force-inline-literal`
-```
-.force-inline-literal <function>
-```
-Marks a literal function as forced-inline.
-
-#### 3.3.8 `.func` / `.endfunc`
-```
-.func <name> <attrs...>
-  .params <types...>
-  .locals <types...>
-  <instructions>
-.endfunc
-```
-Attributes:
-- `ret=<type>`
-- `params=<count>`
-- `locals=<count>`
-- `varargs`
-- `no-return` or `noreturn`
-- `preserve`
-- `hidden`
-- `force-inline-literal`
-- `section="..."`
-
-Rules:
-- Varargs functions must have at least one explicit parameter.
-- If `params>0`, a `.params` line must appear before instructions.
-- If `locals>0`, a `.locals` line must appear before instructions.
-- `.params` and `.locals` must list exactly the declared count of types.
-
-#### 3.3.9 `.literal` / `.endliteral`
-```
-.literal
-  <raw lines>
-.endliteral
-```
-- The literal block belongs to the current function and makes it a literal function.
-- Literal functions cannot contain bytecode instructions.
-- The block must contain at least one line.
-
-### 3.4 String Literals
-Quoted string literals are parsed with these escapes:
-- `\n`, `\r`, `\t`, `\\`, `\"`, `\0`, `\xNN`
-
-### 3.5 Instructions
-Each instruction is one line.
-
-#### 3.5.1 Constants
-- `const <type> <literal>`
-  - `ptr` literals allow `null` or an integer address.
-- `const_str "..."`
-
-#### 3.5.2 Parameters and Locals
-- `load_param <index>`
-- `addr_param <index>`
-- `load_local <index>`
-- `store_local <index>`
-- `addr_local <index>`
-
-#### 3.5.3 Globals
-- `load_global <symbol>`
-- `store_global <symbol>`
-- `addr_global <symbol>` (symbol may refer to globals, functions, or externs)
-
-#### 3.5.4 Indirect Memory
-- `load_indirect <type>`
-- `store_indirect <type>`
-
-#### 3.5.5 Arithmetic and Logic
-- `binop <op> <type> [unsigned]`
-  - `op`: `add`, `sub`, `mul`, `div`, `mod`, `and`, `or`, `xor`, `shl`, `shr`
-- `unop <op> <type>`
-  - `op`: `neg`, `not`, `bitnot`
-- `compare <op> <type> [unsigned]`
-  - `op`: `eq`, `ne`, `lt`, `le`, `gt`, `ge`
-
-#### 3.5.6 Conversions
-- `convert <kind> <from> <to>`
-  - `kind`: `trunc`, `sext`, `zext`, `f2i`, `i2f`, `bitcast`
-
-#### 3.5.7 Control Flow
-- `label <name>`
-- `jump <label>`
-- `branch <true_label> <false_label>`
-
-#### 3.5.8 Calls
-- `call <symbol> <ret> (<args>) [varargs]`
-- `call_indirect <ret> (<args>) [varargs]`
-
-#### 3.5.9 Stack and Return
-- `stack_alloc <bytes> <align>`
-- `drop <type>`
-- `ret [void]`
-
-#### 3.5.10 Misc
-- `comment <text...>`
-
-## 4. Binary Format (.ccbin)
+## Contact
+- Discord: Azureian
+- Email: me@nhornby.com
 ### 4.1 File Header
 - Magic: `CCBIN` (5 bytes)
 - Format version: `u16` (current writer emits `4`)
