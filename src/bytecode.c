@@ -731,6 +731,8 @@ static bool cc_instruction_is_pure(const CCInstruction *ins)
     case CC_INSTR_BINOP:
     case CC_INSTR_UNOP:
     case CC_INSTR_COMPARE:
+    case CC_INSTR_TEST_NULL:
+    case CC_INSTR_DUP:
     case CC_INSTR_CONVERT:
         return true;
     default:
@@ -1224,6 +1226,54 @@ static bool cc_function_fold_const_compares(CCFunction *fn)
     return changed;
 }
 
+static bool cc_function_fold_const_test_null(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    size_t i = 0;
+    while (i + 1 < fn->instruction_count)
+    {
+        CCInstruction *value = &fn->instructions[i];
+        CCInstruction *test = &fn->instructions[i + 1];
+
+        if (value->kind != CC_INSTR_CONST || test->kind != CC_INSTR_TEST_NULL)
+        {
+            ++i;
+            continue;
+        }
+
+        bool is_null = false;
+        if (value->data.constant.type == CC_TYPE_PTR)
+        {
+            is_null = value->data.constant.is_null || value->data.constant.value.u64 == 0ULL;
+        }
+        else if (cc_value_type_is_integer(value->data.constant.type))
+        {
+            unsigned bits = cc_value_type_bit_width(value->data.constant.type);
+            unsigned long long mask = cc_mask_for_bits(bits);
+            is_null = (value->data.constant.value.u64 & mask) == 0ULL;
+        }
+        else
+        {
+            ++i;
+            continue;
+        }
+
+        value->data.constant.type = CC_TYPE_I1;
+        value->data.constant.value.u64 = is_null ? 1ULL : 0ULL;
+        value->data.constant.value.i64 = is_null ? 1LL : 0LL;
+        value->data.constant.is_unsigned = true;
+        value->data.constant.is_null = !is_null;
+
+        cc_function_remove_instructions(fn, i + 1, 1);
+        changed = true;
+    }
+
+    return changed;
+}
+
 static bool cc_function_fold_const_converts(CCFunction *fn)
 {
     if (!fn)
@@ -1376,6 +1426,173 @@ static bool cc_function_fold_const_converts(CCFunction *fn)
 
         cc_function_remove_instructions(fn, i + 1, 1);
         changed = true;
+    }
+
+    return changed;
+}
+
+static bool cc_instruction_is_optimizer_barrier(const CCInstruction *ins)
+{
+    if (!ins)
+        return true;
+    switch (ins->kind)
+    {
+    case CC_INSTR_LABEL:
+    case CC_INSTR_JUMP:
+    case CC_INSTR_BRANCH:
+    case CC_INSTR_RET:
+    case CC_INSTR_CALL:
+    case CC_INSTR_CALL_INDIRECT:
+    case CC_INSTR_STORE_INDIRECT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool cc_function_propagate_local_values(CCFunction *fn)
+{
+    if (!fn || fn->instruction_count < 2)
+        return false;
+
+    bool changed = false;
+    for (size_t i = 0; i + 1 < fn->instruction_count; ++i)
+    {
+        CCInstruction *first = &fn->instructions[i];
+        CCInstruction *second = &fn->instructions[i + 1];
+
+        if (first->kind == CC_INSTR_CONST && second->kind == CC_INSTR_STORE_LOCAL)
+        {
+            const uint32_t tracked_local = second->data.local.index;
+            const CCValueType tracked_type = second->data.local.type;
+            const CCInstruction constant = *first;
+
+            for (size_t j = i + 2; j < fn->instruction_count; ++j)
+            {
+                CCInstruction *candidate = &fn->instructions[j];
+                if (cc_instruction_is_optimizer_barrier(candidate))
+                    break;
+
+                if ((candidate->kind == CC_INSTR_STORE_LOCAL || candidate->kind == CC_INSTR_ADDR_LOCAL) &&
+                    candidate->data.local.index == tracked_local)
+                    break;
+
+                if (candidate->kind == CC_INSTR_LOAD_LOCAL &&
+                    candidate->data.local.index == tracked_local &&
+                    candidate->data.local.type == tracked_type)
+                {
+                    candidate->kind = CC_INSTR_CONST;
+                    candidate->data.constant = constant.data.constant;
+                    changed = true;
+                }
+            }
+        }
+
+        if (first->kind != CC_INSTR_LOAD_LOCAL || second->kind != CC_INSTR_STORE_LOCAL)
+            continue;
+
+        const uint32_t src_local = first->data.local.index;
+        const uint32_t dst_local = second->data.local.index;
+        const CCValueType src_type = first->data.local.type;
+        const CCValueType dst_type = second->data.local.type;
+        if (src_local == dst_local || src_type != dst_type)
+            continue;
+
+        for (size_t j = i + 2; j < fn->instruction_count; ++j)
+        {
+            CCInstruction *candidate = &fn->instructions[j];
+            if (cc_instruction_is_optimizer_barrier(candidate))
+                break;
+
+            if ((candidate->kind == CC_INSTR_STORE_LOCAL || candidate->kind == CC_INSTR_ADDR_LOCAL) &&
+                (candidate->data.local.index == src_local || candidate->data.local.index == dst_local))
+                break;
+
+            if (candidate->kind == CC_INSTR_LOAD_LOCAL &&
+                candidate->data.local.index == dst_local &&
+                candidate->data.local.type == dst_type)
+            {
+                candidate->data.local.index = src_local;
+                candidate->data.local.type = src_type;
+                changed = true;
+            }
+        }
+    }
+
+    return changed;
+}
+
+static bool cc_function_remove_dead_local_stores(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    size_t i = 0;
+    while (i < fn->instruction_count)
+    {
+        CCInstruction *store = &fn->instructions[i];
+        if (store->kind != CC_INSTR_STORE_LOCAL)
+        {
+            ++i;
+            continue;
+        }
+
+        uint32_t local_idx = store->data.local.index;
+        bool used = false;
+        bool overwritten = false;
+
+        for (size_t j = i + 1; j < fn->instruction_count; ++j)
+        {
+            const CCInstruction *candidate = &fn->instructions[j];
+            if (!candidate)
+                break;
+
+            if (candidate->kind == CC_INSTR_LABEL ||
+                candidate->kind == CC_INSTR_JUMP ||
+                candidate->kind == CC_INSTR_BRANCH ||
+                candidate->kind == CC_INSTR_RET)
+            {
+                break;
+            }
+
+            if ((candidate->kind == CC_INSTR_LOAD_LOCAL || candidate->kind == CC_INSTR_ADDR_LOCAL) &&
+                candidate->data.local.index == local_idx)
+            {
+                used = true;
+                break;
+            }
+
+            if (candidate->kind == CC_INSTR_STORE_LOCAL &&
+                candidate->data.local.index == local_idx)
+            {
+                overwritten = true;
+                break;
+            }
+        }
+
+        if (used)
+        {
+            ++i;
+            continue;
+        }
+
+        (void)overwritten;
+        size_t remove_index = i;
+        size_t remove_count = 1;
+        if (i > 0)
+        {
+            const CCInstruction *prev = &fn->instructions[i - 1];
+            if (cc_instruction_is_pure(prev))
+            {
+                remove_index = i - 1;
+                remove_count = 2;
+            }
+        }
+        cc_function_remove_instructions(fn, remove_index, remove_count);
+        changed = true;
+        if (remove_index > 0)
+            --i;
     }
 
     return changed;
@@ -1617,6 +1834,8 @@ void cc_module_optimize(CCModule *module, int opt_level)
                     progress = true;
                 if (cc_function_fold_const_compares(fn))
                     progress = true;
+                if (cc_function_fold_const_test_null(fn))
+                    progress = true;
                 if (cc_function_simplify_const_branches(fn))
                     progress = true;
                 if (cc_function_prune_dropped_values(fn))
@@ -1624,6 +1843,8 @@ void cc_module_optimize(CCModule *module, int opt_level)
             }
             if (opt_level >= 3)
             {
+                if (cc_function_propagate_local_values(fn))
+                    progress = true;
                 if (cc_function_elide_store_load_pairs(fn))
                     progress = true;
                 if (cc_function_remove_unused_locals(fn))
@@ -1915,6 +2136,14 @@ static bool cc_write_instruction(FILE *out, const CCInstruction *ins)
         if (!cc_write_value_type(out, ins->data.compare.type))
             return false;
         if (!cc_write_bool(out, ins->data.compare.is_unsigned))
+            return false;
+        return true;
+    }
+    case CC_INSTR_TEST_NULL:
+        return true;
+    case CC_INSTR_DUP:
+    {
+        if (!cc_write_value_type(out, ins->data.dup.type))
             return false;
         return true;
     }

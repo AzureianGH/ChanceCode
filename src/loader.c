@@ -1094,7 +1094,7 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
         for (size_t ins_index = 0; ins_index < instr_count; ++ins_index)
         {
             uint8_t kind_byte = 0;
-            if (!ccbin_read_u8(file, &kind_byte) || kind_byte > (uint8_t)CC_INSTR_COMMENT)
+            if (!ccbin_read_u8(file, &kind_byte) || kind_byte > (uint8_t)CC_INSTR_DUP)
             {
                 if (sink)
                     cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid instruction kind in function index %zu", i);
@@ -1374,6 +1374,20 @@ static bool cc_load_binary(FILE *file, const char *path, CCModule *module, CCDia
                 ins->data.compare.op = (CCCompareOp)op;
                 ins->data.compare.type = ty;
                 ins->data.compare.is_unsigned = is_unsigned;
+                break;
+            }
+            case CC_INSTR_TEST_NULL:
+                break;
+            case CC_INSTR_DUP:
+            {
+                CCValueType ty = CC_TYPE_INVALID;
+                if (!ccbin_read_value_type(file, &ty))
+                {
+                    if (sink)
+                        cc_diag_emit(sink, CC_DIAG_ERROR, 0, 0, "ccbin: invalid dup type in function index %zu", i);
+                    goto fail;
+                }
+                ins->data.dup.type = ty;
                 break;
             }
             case CC_INSTR_CONVERT:
@@ -2843,6 +2857,47 @@ static bool parse_instruction(LoaderState *st, CCFunction *fn, char *line)
         ins->data.compare.op = cond;
         ins->data.compare.type = ty;
         ins->data.compare.is_unsigned = is_unsigned;
+        return true;
+    }
+
+    if (strcmp(mnemonic, "test_null") == 0)
+    {
+        const char *extra = strtok(NULL, " \t");
+        if (extra)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "test_null does not take operands");
+            return false;
+        }
+        ins = append_instruction(st, fn, CC_INSTR_TEST_NULL);
+        if (!ins)
+            return false;
+        return true;
+    }
+
+    if (strcmp(mnemonic, "dup") == 0)
+    {
+        const char *type_tok = strtok(NULL, " \t");
+        const char *extra = strtok(NULL, " \t");
+        if (!type_tok)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "dup requires <type>");
+            return false;
+        }
+        if (extra)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "dup takes only one operand");
+            return false;
+        }
+        CCValueType ty = parse_type_token(type_tok);
+        if (ty == CC_TYPE_INVALID || ty == CC_TYPE_VOID)
+        {
+            loader_diag(st, CC_DIAG_ERROR, st->line, "invalid dup type '%s'", type_tok);
+            return false;
+        }
+        ins = append_instruction(st, fn, CC_INSTR_DUP);
+        if (!ins)
+            return false;
+        ins->data.dup.type = ty;
         return true;
     }
 

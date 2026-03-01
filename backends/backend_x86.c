@@ -2199,6 +2199,44 @@ static bool emit_compare(X86FunctionContext *ctx, const CCInstruction *ins)
     return emit_push_rax(ctx->out, ctx, CC_TYPE_I1, true);
 }
 
+static bool emit_test_null(X86FunctionContext *ctx, const CCInstruction *ins)
+{
+    StackValue value;
+    if (!emit_pop_to_rax(ctx->out, ctx, &value))
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "test_null requires one operand");
+        return false;
+    }
+
+    fprintf(ctx->out, "    cmp rax, 0\n");
+    fprintf(ctx->out, "    sete al\n");
+    fprintf(ctx->out, "    movzx eax, al\n");
+    return emit_push_rax(ctx->out, ctx, CC_TYPE_I1, true);
+}
+
+static bool emit_dup(X86FunctionContext *ctx, const CCInstruction *ins)
+{
+    StackValue value;
+    if (!emit_pop_to_rax(ctx->out, ctx, &value))
+    {
+        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "dup requires one operand");
+        return false;
+    }
+
+    if (value.type != ins->data.dup.type)
+    {
+        const char *expected = cc_value_type_name(ins->data.dup.type);
+        const char *actual = cc_value_type_name(value.type);
+        emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "dup expected %s but found %s",
+                  expected ? expected : "<unknown>", actual ? actual : "<unknown>");
+        return false;
+    }
+
+    if (!emit_push_rax(ctx->out, ctx, value.type, value.is_unsigned))
+        return false;
+    return emit_push_rax(ctx->out, ctx, value.type, value.is_unsigned);
+}
+
 static bool emit_convert(X86FunctionContext *ctx, const CCInstruction *ins)
 {
     StackValue value;
@@ -2715,6 +2753,10 @@ static bool emit_instruction(X86FunctionContext *ctx, const CCInstruction *ins)
         return emit_unary_op(ctx, ins);
     case CC_INSTR_COMPARE:
         return emit_compare(ctx, ins);
+    case CC_INSTR_TEST_NULL:
+        return emit_test_null(ctx, ins);
+    case CC_INSTR_DUP:
+        return emit_dup(ctx, ins);
     case CC_INSTR_CONVERT:
         return emit_convert(ctx, ins);
     case CC_INSTR_STACK_ALLOC:

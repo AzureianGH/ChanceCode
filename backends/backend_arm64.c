@@ -454,6 +454,17 @@ static size_t arm64_compute_max_stack_depth(const CCFunction *fn)
 			else
 				depth = 0;
 			break;
+		case CC_INSTR_COMPARE:
+		case CC_INSTR_TEST_NULL:
+			if (depth == 0)
+				depth = 1;
+			break;
+		case CC_INSTR_DUP:
+			if (depth == 0)
+				depth = 1;
+			else
+				depth += 1;
+			break;
 		case CC_INSTR_CONVERT:
 			/* pop then push */
 			if (depth == 0)
@@ -2611,6 +2622,62 @@ static bool arm64_emit_compare(Arm64FunctionContext *ctx, const CCInstruction *i
 	return function_stack_push(ctx, result);
 }
 
+static bool arm64_emit_test_null(Arm64FunctionContext *ctx, const CCInstruction *ins)
+{
+	Arm64Value value;
+	if (!function_stack_pop(ctx, &value))
+	{
+		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "test_null requires one operand");
+		return false;
+	}
+
+	if (!arm64_spill_value_stack(ctx))
+		return false;
+
+	size_t operand_size = arm64_type_size(value.type);
+	bool use_w = (operand_size <= 4);
+	const char *value_reg = use_w ? ARM64_SCRATCH_GP_REGS32[0] : ARM64_SCRATCH_GP_REGS64[0];
+	if (!arm64_materialize_gp(ctx, &value, value_reg, use_w))
+		return false;
+
+	FILE *out = ctx->out;
+	fprintf(out, "    cmp %s, %s\n", value_reg, use_w ? "wzr" : "xzr");
+	const char *result_reg = ARM64_SCRATCH_GP_REGS32[2];
+	fprintf(out, "    cset %s, eq\n", result_reg);
+
+	Arm64Value result;
+	memset(&result, 0, sizeof(result));
+	result.kind = ARM64_VALUE_REGISTER;
+	result.type = CC_TYPE_I1;
+	result.is_unsigned = true;
+	result.data.reg.name = result_reg;
+	result.data.reg.is_w = true;
+	return function_stack_push(ctx, result);
+}
+
+static bool arm64_emit_dup(Arm64FunctionContext *ctx, const CCInstruction *ins)
+{
+	Arm64Value value;
+	if (!function_stack_pop(ctx, &value))
+	{
+		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "dup requires one operand");
+		return false;
+	}
+
+	if (value.type != ins->data.dup.type)
+	{
+		const char *expected = cc_value_type_name(ins->data.dup.type);
+		const char *actual = cc_value_type_name(value.type);
+		emit_diag(ctx->sink, CC_DIAG_ERROR, ins->line, "dup expected %s but found %s",
+				  expected ? expected : "<unknown>", actual ? actual : "<unknown>");
+		return false;
+	}
+
+	if (!function_stack_push(ctx, value))
+		return false;
+	return function_stack_push(ctx, value);
+}
+
 static bool arm64_emit_branch(Arm64FunctionContext *ctx, const CCInstruction *ins)
 {
 	if (!ctx || !ctx->fn || !ins || !ins->data.branch.true_target || !ins->data.branch.false_target)
@@ -2920,7 +2987,8 @@ static bool arm64_emit_call(Arm64FunctionContext *ctx, const CCInstruction *ins)
 	bool call_declares_varargs = ins->data.call.is_varargs;
 	if (!call_declares_varargs && have_prototype && callee_is_varargs)
 		call_declares_varargs = true;
-	bool use_vararg_pack = call_declares_varargs && arm64_symbol_uses_cc_varargs(ins->data.call.symbol);
+	bool darwin_vararg_abi = (ctx->module && ctx->module->config && ctx->module->config->format == ARM64_OBJECT_MACHO);
+	bool use_vararg_pack = call_declares_varargs && (darwin_vararg_abi || arm64_symbol_uses_cc_varargs(ins->data.call.symbol));
 
 	if (have_prototype && !callee_is_varargs && arg_count > fixed_params)
 	{
@@ -3316,6 +3384,10 @@ static bool arm64_emit_instruction(Arm64FunctionContext *ctx, const CCInstructio
 		return arm64_emit_unop(ctx, ins);
 	case CC_INSTR_COMPARE:
 		return arm64_emit_compare(ctx, ins);
+	case CC_INSTR_TEST_NULL:
+		return arm64_emit_test_null(ctx, ins);
+	case CC_INSTR_DUP:
+		return arm64_emit_dup(ctx, ins);
 	case CC_INSTR_CONVERT:
 		return arm64_emit_convert(ctx, ins);
 	case CC_INSTR_DROP:

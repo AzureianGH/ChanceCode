@@ -97,7 +97,9 @@ extern "C"
         CC_INSTR_CALL,
         CC_INSTR_RET,
         CC_INSTR_COMMENT,
-        CC_INSTR_CALL_INDIRECT
+        CC_INSTR_CALL_INDIRECT,
+        CC_INSTR_TEST_NULL,
+        CC_INSTR_DUP
     } CCInstrKind;
 
     typedef enum
@@ -262,6 +264,10 @@ extern "C"
             {
                 CCValueType type;
             } drop;
+            struct
+            {
+                CCValueType type;
+            } dup;
             struct
             {
                 bool has_value;

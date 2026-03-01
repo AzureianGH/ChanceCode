@@ -1802,6 +1802,65 @@ static bool bslash_emit_function(BSlashFunctionContext *ctx, const CCFunction *f
             }
             break;
         }
+        case CC_INSTR_TEST_NULL:
+        {
+            const char *value = bslash_stack_pop(ctx, ins->line);
+            if (!value)
+            {
+                success = false;
+                goto cleanup;
+            }
+
+            bslash_ensure_register_materialized(ctx, value);
+            fprintf(ctx->out, "    CMPI32 %s, #0x00000000\n", value);
+
+            char true_label[128];
+            char end_label[128];
+            bslash_make_temp_label(ctx, true_label, sizeof(true_label), "tnull_true");
+            bslash_make_temp_label(ctx, end_label, sizeof(end_label), "tnull_end");
+
+            bslash_emit_movi32_u32(ctx, value, 0);
+            fprintf(ctx->out, "    BZ %s\n", true_label);
+            fprintf(ctx->out, "    J32 %s\n", end_label);
+            fprintf(ctx->out, "%s:\n", true_label);
+            bslash_emit_movi32_u32(ctx, value, 1);
+            fprintf(ctx->out, "%s:\n", end_label);
+
+            bslash_clear_register_info(ctx, value);
+            if (!bslash_stack_push_existing(ctx, ins->line, value))
+            {
+                success = false;
+                goto cleanup;
+            }
+            break;
+        }
+        case CC_INSTR_DUP:
+        {
+            const char *value = bslash_stack_pop(ctx, ins->line);
+            if (!value)
+            {
+                success = false;
+                goto cleanup;
+            }
+
+            if (!bslash_stack_push_existing(ctx, ins->line, value))
+            {
+                success = false;
+                goto cleanup;
+            }
+
+            const char *copy = NULL;
+            if (!bslash_stack_push_new(ctx, ins->line, &copy))
+            {
+                success = false;
+                goto cleanup;
+            }
+
+            bslash_ensure_register_materialized(ctx, value);
+            bslash_emit_mov(ctx, copy, value);
+            bslash_clear_register_info(ctx, copy);
+            break;
+        }
         case CC_INSTR_CONVERT:
         {
             const char *value = bslash_stack_pop(ctx, ins->line);
