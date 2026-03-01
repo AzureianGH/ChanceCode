@@ -1412,7 +1412,37 @@ static bool cc_function_fold_const_converts(CCFunction *fn)
             break;
         case CC_CONVERT_BITCAST:
             if (from == to)
+            {
                 handled = true;
+            }
+            else if (!cc_value_type_is_float(from) && !cc_value_type_is_float(to))
+            {
+                unsigned from_bits = cc_value_type_bit_width(from);
+                unsigned to_bits = cc_value_type_bit_width(to);
+                if (from_bits > 0 && to_bits > 0)
+                {
+                    unsigned long long raw = source->data.constant.value.u64;
+                    if (from_bits < 64)
+                        raw &= cc_mask_for_bits(from_bits);
+                    if (to_bits < 64)
+                        raw &= cc_mask_for_bits(to_bits);
+
+                    source->data.constant.value.u64 = raw;
+                    if (cc_value_type_is_signed(to))
+                    {
+                        source->data.constant.value.i64 = cc_sign_extend_bits(raw, to_bits);
+                        source->data.constant.is_unsigned = false;
+                    }
+                    else
+                    {
+                        source->data.constant.value.i64 = (long long)raw;
+                        source->data.constant.is_unsigned = true;
+                    }
+                    source->data.constant.type = to;
+                    source->data.constant.is_null = (raw == 0ULL);
+                    handled = true;
+                }
+            }
             break;
         default:
             break;
@@ -1426,6 +1456,113 @@ static bool cc_function_fold_const_converts(CCFunction *fn)
 
         cc_function_remove_instructions(fn, i + 1, 1);
         changed = true;
+    }
+
+    return changed;
+}
+
+static bool cc_function_simplify_binop_identities(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    size_t i = 0;
+    while (i + 2 < fn->instruction_count)
+    {
+        CCInstruction *lhs = &fn->instructions[i];
+        CCInstruction *rhs = &fn->instructions[i + 1];
+        CCInstruction *bin = &fn->instructions[i + 2];
+
+        if (bin->kind != CC_INSTR_BINOP)
+        {
+            ++i;
+            continue;
+        }
+
+        CCValueType type = bin->data.binop.type;
+        if (!(cc_value_type_is_integer(type) || type == CC_TYPE_PTR))
+        {
+            ++i;
+            continue;
+        }
+
+        bool rhs_zero = (rhs->kind == CC_INSTR_CONST && rhs->data.constant.type == type && rhs->data.constant.value.u64 == 0ULL);
+        bool lhs_zero = (lhs->kind == CC_INSTR_CONST && lhs->data.constant.type == type && lhs->data.constant.value.u64 == 0ULL);
+
+        if (rhs_zero)
+        {
+            switch (bin->data.binop.op)
+            {
+            case CC_BINOP_ADD:
+            case CC_BINOP_SUB:
+            case CC_BINOP_OR:
+            case CC_BINOP_XOR:
+                cc_function_remove_instructions(fn, i + 1, 2);
+                changed = true;
+                continue;
+            default:
+                break;
+            }
+        }
+
+        if (lhs_zero)
+        {
+            switch (bin->data.binop.op)
+            {
+            case CC_BINOP_ADD:
+            case CC_BINOP_OR:
+            case CC_BINOP_XOR:
+                cc_function_remove_instructions(fn, i + 2, 1);
+                cc_function_remove_instructions(fn, i, 1);
+                changed = true;
+                continue;
+            default:
+                break;
+            }
+        }
+
+        ++i;
+    }
+
+    return changed;
+}
+
+static bool cc_function_remove_redundant_bitcast_pairs(CCFunction *fn)
+{
+    if (!fn)
+        return false;
+
+    bool changed = false;
+    size_t i = 0;
+    while (i + 1 < fn->instruction_count)
+    {
+        CCInstruction *first = &fn->instructions[i];
+        CCInstruction *second = &fn->instructions[i + 1];
+
+        if (first->kind != CC_INSTR_CONVERT || second->kind != CC_INSTR_CONVERT)
+        {
+            ++i;
+            continue;
+        }
+
+        if (first->data.convert.kind != CC_CONVERT_BITCAST || second->data.convert.kind != CC_CONVERT_BITCAST)
+        {
+            ++i;
+            continue;
+        }
+
+        if (first->data.convert.from_type == second->data.convert.to_type &&
+            first->data.convert.to_type == second->data.convert.from_type)
+        {
+            cc_function_remove_instructions(fn, i, 2);
+            changed = true;
+            if (i > 0)
+                --i;
+            continue;
+        }
+
+        ++i;
     }
 
     return changed;
@@ -1541,6 +1678,7 @@ static bool cc_function_remove_dead_local_stores(CCFunction *fn)
         uint32_t local_idx = store->data.local.index;
         bool used = false;
         bool overwritten = false;
+        bool hit_barrier = false;
 
         for (size_t j = i + 1; j < fn->instruction_count; ++j)
         {
@@ -1550,11 +1688,14 @@ static bool cc_function_remove_dead_local_stores(CCFunction *fn)
 
             if (candidate->kind == CC_INSTR_LABEL ||
                 candidate->kind == CC_INSTR_JUMP ||
-                candidate->kind == CC_INSTR_BRANCH ||
-                candidate->kind == CC_INSTR_RET)
+                candidate->kind == CC_INSTR_BRANCH)
             {
+                hit_barrier = true;
                 break;
             }
+
+            if (candidate->kind == CC_INSTR_RET)
+                break;
 
             if ((candidate->kind == CC_INSTR_LOAD_LOCAL || candidate->kind == CC_INSTR_ADDR_LOCAL) &&
                 candidate->data.local.index == local_idx)
@@ -1577,7 +1718,12 @@ static bool cc_function_remove_dead_local_stores(CCFunction *fn)
             continue;
         }
 
-        (void)overwritten;
+        if (hit_barrier && !overwritten)
+        {
+            ++i;
+            continue;
+        }
+
         size_t remove_index = i;
         size_t remove_count = 1;
         if (i > 0)
@@ -1826,11 +1972,15 @@ void cc_module_optimize(CCModule *module, int opt_level)
                 progress = true;
             if (opt_level >= 2)
             {
+                if (cc_function_simplify_binop_identities(fn))
+                    progress = true;
                 if (cc_function_fold_const_binops(fn))
                     progress = true;
                 if (cc_function_fold_const_unops(fn))
                     progress = true;
                 if (cc_function_fold_const_converts(fn))
+                    progress = true;
+                if (cc_function_remove_redundant_bitcast_pairs(fn))
                     progress = true;
                 if (cc_function_fold_const_compares(fn))
                     progress = true;
@@ -1844,6 +1994,8 @@ void cc_module_optimize(CCModule *module, int opt_level)
             if (opt_level >= 3)
             {
                 if (cc_function_propagate_local_values(fn))
+                    progress = true;
+                if (cc_function_remove_dead_local_stores(fn))
                     progress = true;
                 if (cc_function_elide_store_load_pairs(fn))
                     progress = true;
